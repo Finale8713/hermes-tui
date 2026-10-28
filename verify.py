@@ -177,7 +177,7 @@ def main():
     if missing:
         print("this checkout does not carry the TUI port: {} of {} listed "
               "test files are missing (first: {}). The port lives on branch "
-              "tui-port-v0.22.4 in the tank bare repo; install it first "
+              "tui-port-v0.22.4 of the port repository; install it first "
               "(packaging-design.md has the quickstart) or pass --repo at a "
               "checkout that carries it.".format(
                   len(missing), len(TESTS), missing[0]), file=sys.stderr)
