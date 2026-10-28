@@ -1,0 +1,9 @@
+# Merge only these keys into the existing default-profile display section.
+# This is a reference fragment, not a complete Hermes config.
+# 2026-10-21: runtime_footer.right_badge removed — that section belongs to the OTHER
+# machine's restructured port and is not recognized by this install's binary.
+display:
+  code_highlighting: true
+  status_bar:
+    fields: [model, context_pct, total_tokens, tps, latency, cache_hit, duration, cost]
+    right_badge: cost

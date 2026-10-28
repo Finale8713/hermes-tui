@@ -1,0 +1,2985 @@
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index 1936663609..9b8c045c46 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -679,7 +679,7 @@ PLATFORM_HINTS = {
+         "configured destination — put the primary content directly in your response."
+     ),
+     "cli": (
+-        # Maintainer-verified live: the CLI prints raw text.
++        # Fallback for profiles without opt-in fenced-code highlighting.
+         "You are in a plain terminal (CLI). Markdown does NOT render — asterisks, headers, and fences appear as "
+         "literal characters, so write plain text (indentation and blank lines are your only layout tools). Files: "
+         "there is no attachment channel and MEDIA:/path tags are NOT intercepted here (they print as literal text) — "
+@@ -1016,6 +1016,25 @@ def _config_readonly(what: str) -> dict:
+         return {}
+ 
+ 
++def cli_platform_hint() -> str:
++    """Describe the active profile's opt-in code renderer without changing other surfaces."""
++    config = _config_readonly("CLI display capabilities")
++    display = config.get("display", {}) if isinstance(config, dict) else {}
++    if not isinstance(display, dict) or display.get("code_highlighting") is not True:
++        return PLATFORM_HINTS["cli"]
++    return (
++        "You are in the Hermes terminal (CLI). Write prose as plain text. "
++        "For code snippets, use fenced code blocks with a language tag, such as python, bash, "
++        "or makefile. The CLI renders these blocks with syntax colors and hides their outer fences. "
++        "Preserve source indentation and literal tabs. Do not emit terminal escape sequences. "
++        "Terminal selection may expand tabs or include panel borders; for byte-exact source, "
++        "write a file and provide its path. Files: there is no attachment channel and MEDIA:/path "
++        "tags are NOT intercepted here. Deliver a file by stating its absolute path or URL "
++        "in plain text; the user opens it themselves. "
++        f"{_LOCAL_CRON_DELIVERY_NOTE}"
++    )
++
++
+ def _embedder_environment_hint() -> str:
+     """Embedder-supplied environment description: HERMES_ENVIRONMENT_HINT (container ENV)
+     wins over config.yaml ``agent.environment_hint``. Read once at prompt-build time."""
+diff --git a/agent/system_prompt.py b/agent/system_prompt.py
+index 03ede0060d..f3e5b22f03 100644
+--- a/agent/system_prompt.py
++++ b/agent/system_prompt.py
+@@ -412,7 +412,7 @@ def _active_profile_line(agent: Any) -> str:
+ 
+ def _default_platform_hint(platform_key: str) -> str:
+     """Built-in hint, else the plugin adapter's ``platform_hint``, else ``""``."""
+-    hint = PLATFORM_HINTS.get(platform_key, "")
++    hint = _pb.cli_platform_hint() if platform_key == "cli" else PLATFORM_HINTS.get(platform_key, "")
+     if not hint and platform_key:
+         try:
+             from gateway.platform_registry import platform_registry
+diff --git a/agent/turn_usage.py b/agent/turn_usage.py
+index 6fd993664b..b0f2c7a46b 100644
+--- a/agent/turn_usage.py
++++ b/agent/turn_usage.py
+@@ -96,6 +96,27 @@ def record_response_usage(
+             "API call #%d: model=%s provider=%s in=? out=? total=? latency=%.1fs usage=unavailable",
+             agent.session_api_calls, agent.model, agent.provider or "unknown", api_duration,
+         )
++        # Persist the attempt as an unknown-cost delta so the session cannot claim
++        # complete cost coverage over a call the provider never priced. Zero-token:
++        # no usage figures may be invented here.
++        if agent._session_db and agent.session_id:
++            try:
++                if not agent._session_db_created:
++                    agent._ensure_db_session()
++                agent._session_db.queue_token_counts(
++                    agent.session_id,
++                    source=_agent_session_source(agent),
++                    cost_status="unknown",
++                    cost_source="none",
++                    billing_provider=agent.provider,
++                    billing_base_url=agent.base_url,
++                    model=agent.model,
++                    api_call_count=1,
++                    task=getattr(agent, "_turn_route_task", "") or "",
++                )
++            except Exception as e:  # silent loss here undercounts coverage, not dollars
++                logger.debug(
++                    "Missing-usage persistence failed (session=%s): %s", agent.session_id, e)
+         return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
+ 
+     canonical_usage = with_served_service_tier(
+diff --git a/agent/usage_pricing.py b/agent/usage_pricing.py
+index c439022f0e..f7e430531d 100644
+--- a/agent/usage_pricing.py
++++ b/agent/usage_pricing.py
+@@ -7,6 +7,7 @@ from datetime import datetime, timezone, UTC
+ from decimal import Decimal
+ from typing import Any, Dict, Literal, Optional
+ 
++from agent import model_metadata
+ from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata, strip_codex_context_variant_suffix
+ from utils import base_url_host_matches, base_url_hostname, base_url_origin
+ 
+@@ -36,6 +37,22 @@ _SUBCENT_THRESHOLD = Decimal("0.01")
+ _INCLUDED_NOTE = "subscription-included; no provider invoice for usage"
+ 
+ 
++def cost_subprecision_text(amount, decimals: int = 4) -> Optional[str]:
++    """Dollar text for a positive amount that renders as zero at `decimals`
++    precision, e.g. "$<0.0001"; None when the amount renders nonzero.
++
++    Shared by per-response labels and the session-cost badge so a positive
++    total never reads as zero. Uses the render-and-compare trick: a naive
++    numeric threshold misses the exact boundary under ROUND_HALF_EVEN.
++    """
++    if amount <= 0:
++        return None
++    rendered = f"{amount:.{decimals}f}"
++    if float(rendered) != 0.0:
++        return None
++    return f"$<{'0.' + '0' * (decimals - 1) + '1'}"
++
++
+ def format_cost_label(amount: Decimal) -> str:
+     """Cost display label: zero → "$0.00"; sub-cent → "~$0.0046" (4 dp, or
+     "~$<0.0001" when it rounds to 0.0000 so the label never reads as zero);
+@@ -47,12 +64,10 @@ def format_cost_label(amount: Decimal) -> str:
+     if amount == _ZERO:
+         return "$0.00"
+     if amount < _SUBCENT_THRESHOLD:
+-        label = f"~${amount:.4f}"
+-        # Compare the rendered label: a naive `< 0.00005` threshold misses
+-        # the exact boundary under ROUND_HALF_EVEN.
+-        # A positive amount that rounds to 0.0000 at 4 dp would render "~$0.0000" — a zero-looking label,
+-        # the exact #79220 dishonesty.
+-        return label if label != "~$0.0000" else "~$<0.0001"
++        qualifier = cost_subprecision_text(amount, 4)
++        if qualifier:
++            return f"~{qualifier}"
++        return f"~${amount:.4f}"
+     return f"~${amount:.2f}"
+ 
+ CostStatus = Literal["actual", "estimated", "included", "unknown"]
+@@ -120,6 +135,10 @@ class PricingEntry:
+     output_cost_per_million_above: Optional[Decimal] = None
+     cache_read_cost_per_million_above: Optional[Decimal] = None
+     cache_write_cost_per_million_above: Optional[Decimal] = None
++    request_cost_above: Optional[Decimal] = None
++    # OpenRouter metadata tiers: {min_prompt_tokens: {component: per-million rate}}.
++    # A None component rate falls back to the base rate for that request.
++    context_tiers: Optional[dict[int, dict[str, Optional[Decimal]]]] = None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -513,7 +532,7 @@ def _anthropic_fast_mode_entry(model: str) -> Optional[PricingEntry]:
+ 
+ def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
+     return _pricing_entry_from_metadata(
+-        fetch_model_metadata(), route.model,
++        model_metadata.fetch_model_metadata(), route.model,
+         source_url="https://openrouter.ai/docs/api/api-reference/models/get-models",
+         pricing_version="openrouter-models-api",
+     )
+@@ -538,12 +557,63 @@ def _pricing_entry_from_metadata(
+     request = _to_decimal(pricing.get("request"))
+     if prompt is None and completion is None and request is None:
+         return None
++
++    # Context-tier overrides (OpenRouter ``pricing.overrides``): each entry names
++    # a whole-request threshold on prompt tokens and its own per-token rates.
++    # Missing override fields fall back to the base rate for that component; a
++    # tier whose threshold is absent/non-positive or that carries no rate at all
++    # is malformed and ignored. The entry stores the LOWEST valid threshold so
++    # per-request selection (estimate_usage_cost) can walk every tier.
++    threshold: Optional[int] = None
++    tier_rates: dict[int, dict[str, Optional[Decimal]]] = {}
++    overrides = pricing.get("overrides")
++    if isinstance(overrides, list):
++        for override in overrides:
++            if not isinstance(override, dict):
++                continue
++            raw_min = override.get("min_prompt_tokens")
++            if isinstance(raw_min, bool):  # JSON true/false are ints in Python
++                continue
++            try:
++                min_tokens = int(raw_min)
++            except (TypeError, ValueError):
++                continue
++            if min_tokens <= 0:
++                continue
++            rates = {
++                "input": _to_decimal(override.get("prompt")),
++                "output": _to_decimal(override.get("completion")),
++                "cache_read": _to_decimal(override.get(
++                    "cache_read", override.get("cached_prompt", override.get("input_cache_read")))),
++                "cache_write": _to_decimal(override.get(
++                    "cache_write", override.get("cache_creation", override.get("input_cache_write")))),
++                "request": _to_decimal(override.get("request")),
++            }
++            # Metadata rates are per-token USD; store per-million like the base
++            # rates. ``request`` is a per-request charge and stays as-is.
++            rates = {
++                key: None if value is None else value * _ONE_MILLION
++                for key, value in rates.items() if key != "request"
++            } | {"request": rates["request"]}
++            if all(value is None for value in rates.values()):
++                continue
++            # Later entries at the same threshold win field-by-field (the
++            # provider lists tiers in ascending threshold order).
++            merged = tier_rates.setdefault(min_tokens, {})
++            for name, value in rates.items():
++                if value is not None:
++                    merged[name] = value
++            if threshold is None or min_tokens < threshold:
++                threshold = min_tokens
++
+     return PricingEntry(
+         input_cost_per_million=prompt, output_cost_per_million=completion,
+         cache_read_cost_per_million=per_million("cache_read", "cached_prompt", "input_cache_read"),
+         cache_write_cost_per_million=per_million("cache_write", "cache_creation", "input_cache_write"),
+         request_cost=request, source="provider_models_api", source_url=source_url,
+         pricing_version=pricing_version, fetched_at=_UTC_NOW(),
++        tier_threshold_tokens=threshold,
++        context_tiers=dict(tier_rates) if tier_rates else None,
+     )
+ 
+ 
+@@ -711,27 +781,43 @@ def estimate_usage_cost(
+     if not entry:
+         return _unknown_cost("none")
+ 
+-    # Whole-request context tier (e.g. Gemini Pro >200k prompts): above the
+-    # threshold the *_above rates apply to the entire request; None falls back.
+-    above = entry.tier_threshold_tokens is not None and usage.prompt_tokens > entry.tier_threshold_tokens
++    # Whole-request context tier. Google-style ``*_above`` fields and OpenRouter
++    # metadata ``overrides`` both reprice the ENTIRE request when prompt_tokens
++    # crosses the threshold (provider semantics, not marginal brackets); missing
++    # override fields fall back to the base rate for that component.
++    tier_rates = entry.context_tiers or {}
++    applicable = [min_tokens for min_tokens in tier_rates if usage.prompt_tokens >= min_tokens]
++    threshold = entry.tier_threshold_tokens
++    above = bool(tier_rates) and bool(applicable) or (
++        not tier_rates and threshold is not None and usage.prompt_tokens > threshold)
++    selected = max(applicable) if applicable else threshold
++    rates_for_request = tier_rates.get(selected, {}) if tier_rates and applicable else {}
+     amount = _ZERO
+-    for tokens, rate, rate_above, note in (
+-        (usage.input_tokens, entry.input_cost_per_million, entry.input_cost_per_million_above, ()),
+-        (usage.output_tokens, entry.output_cost_per_million, entry.output_cost_per_million_above, ()),
++    for tokens, rate, rate_above, key, note in (
++        (usage.input_tokens, entry.input_cost_per_million, entry.input_cost_per_million_above, "input", ()),
++        (usage.output_tokens, entry.output_cost_per_million, entry.output_cost_per_million_above, "output", ()),
+         (usage.cache_read_tokens, entry.cache_read_cost_per_million, entry.cache_read_cost_per_million_above,
+-         ("cache-read pricing unavailable for route",)),
++         "cache_read", ("cache-read pricing unavailable for route",)),
+         (usage.cache_write_tokens, entry.cache_write_cost_per_million, entry.cache_write_cost_per_million_above,
+-         ("cache-write pricing unavailable for route",)),
++         "cache_write", ("cache-write pricing unavailable for route",)),
+     ):
+-        if above and rate_above is not None:
++        tier_rate = rates_for_request.get(key)
++        if above and tier_rate is not None:
++            rate = tier_rate
++        elif above and rate_above is not None:
+             rate = rate_above
+         if rate is None:
+             if tokens:
+                 return _unknown_cost(entry.source, *note)
+             continue
+         amount += Decimal(tokens) * rate / _ONE_MILLION
+-    if entry.request_cost is not None and usage.request_count:
+-        amount += Decimal(usage.request_count) * entry.request_cost
++    request_rate = entry.request_cost
++    if above and rates_for_request.get("request") is not None:
++        request_rate = rates_for_request["request"]
++    elif above and entry.request_cost_above is not None:
++        request_rate = entry.request_cost_above
++    if request_rate is not None and usage.request_count:
++        amount += Decimal(usage.request_count) * request_rate
+ 
+     notes: list[str] = []
+     status: CostStatus = "estimated"
+diff --git a/hermes_cli/cli_code_blocks.py b/hermes_cli/cli_code_blocks.py
+new file mode 100644
+index 0000000000..0bd6d9c884
+--- /dev/null
++++ b/hermes_cli/cli_code_blocks.py
+@@ -0,0 +1,203 @@
++"""Fenced-code parsing and copy-friendly Rich rendering for the classic CLI.
++
++Only display text is transformed. Buffer each block so multiline lexer state is
++correct, including when a response ends before its closing fence.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from io import StringIO
++import re
++
++from pygments.lexers import get_lexer_by_name
++from pygments.util import ClassNotFound
++from rich.console import Console
++from rich.syntax import Syntax
++from rich.text import Text
++
++_BACKGROUND = "#20242c"
++_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})([^\r\n]*)[\r\n]*$")
++
++
++@dataclass(frozen=True)
++class CodeBlock:
++    code: str
++    language: str
++
++
++class FenceParser:
++    """Consume physical lines; fences must occupy a line, not occur inline."""
++
++    def __init__(self):
++        self.fence = ""
++        self.language = ""
++        self.lines: list[str] = []
++
++    @property
++    def in_code(self) -> bool:
++        return bool(self.fence)
++
++    def push(self, line: str) -> tuple[str, str | CodeBlock | None]:
++        if self.in_code:
++            if re.fullmatch(r" {0,3}" + re.escape(self.fence[0]) +
++                            r"{" + str(len(self.fence)) + r",}[ \t]*(?:\r?\n)?", line):
++                return "block", self.finish()
++            self.lines.append(line)
++            return "code", None
++        match = _OPEN.fullmatch(line)
++        if match and not (match[1][0] == "`" and "`" in match[2]):
++            self.fence = match[1]
++            self.language = match[2].strip().split(maxsplit=1)[0] if match[2].strip() else "text"
++            return "open", None
++        return "prose", line
++
++    def finish(self) -> CodeBlock | None:
++        if not self.in_code:
++            return None
++        block = CodeBlock("".join(self.lines), self.language)
++        self.fence, self.language, self.lines = "", "", []
++        return block
++
++
++def split_fenced_code(text: str):
++    """Yield prose strings and CodeBlocks, preserving code bytes and indentation."""
++    parser = FenceParser()
++    prose: list[str] = []
++    for line in text.splitlines(keepends=True):
++        kind, value = parser.push(line)
++        if kind == "prose":
++            prose.append(value)
++        elif kind == "open" and prose:
++            yield "".join(prose)
++            prose = []
++        elif kind == "block":
++            yield value
++    if prose:
++        yield "".join(prose)
++    block = parser.finish()
++    if block is not None:
++        yield block
++
++
++def strip_fenced_reasoning(text: str) -> str:
++    """Suppress reasoning before recognizing visible fences, preserving literal code tags."""
++    from agent.think_scrubber import THINK_TAG_NAMES
++
++    tags = re.compile(r"<(/?)(" + "|".join(re.escape(tag) for tag in THINK_TAG_NAMES) + r")>",
++                      re.IGNORECASE)
++    parser = FenceParser()
++    hidden: list[str] = []
++    parts: list[str] = []
++    for line in text.splitlines(keepends=True):
++        if parser.in_code:
++            parser.push(line)
++            parser.lines.clear()
++            parts.append(line)
++            continue
++        visible: list[str] = []
++        pos = 0
++        while pos < len(line):
++            # Visible fence info is literal too. Recheck after a reasoning closer
++            # exposes an opener on this same physical line.
++            if not hidden and parser.push("".join(visible) + line[pos:])[0] == "open":
++                visible.append(line[pos:])
++                break
++            match = tags.search(line, pos)
++            if match is None:
++                if not hidden:
++                    visible.append(line[pos:])
++                break
++            if not hidden:
++                visible.append(line[pos:match.start()])
++            name = match[2].lower()
++            if not match[1]:
++                hidden.append(name)
++            elif hidden and hidden[-1] == name:
++                hidden.pop()
++            # A mismatched closer cannot end the active reasoning block.
++            pos = match.end()
++        cleaned = "".join(visible)
++        if cleaned:
++            parts.append(cleaned)
++    return "".join(parts)
++
++
++def fence_opening_possible(text: str) -> bool:
++    """Whether an unfinished physical line can still become a valid opening fence."""
++    return re.fullmatch(r" {0,3}(?:`{1,2}|~{1,2}|`{3,}[^`\r\n]*|~{3,}[^\r\n]*)?", text) is not None
++
++
++def render_code_block(block: CodeBlock) -> Text:
++    """Render display-safe code; use /copy for raw tabs rather than terminal selection."""
++    from tools.ansi_strip import sanitize_display_text
++
++    code = sanitize_display_text(block.code)
++    language = sanitize_display_text(block.language)
++    try:
++        lexer = get_lexer_by_name(language, stripnl=False, ensurenl=False)
++    except ClassNotFound:
++        lexer = get_lexer_by_name("text", stripnl=False, ensurenl=False)
++    syntax = Syntax(code, lexer, theme="monokai", background_color=_BACKGROUND,
++                    line_numbers=False, word_wrap=False)
++    result = Text(language + "\n", style=f"on {_BACKGROUND}")
++    result.stylize("bold #aab7c4", 0, len(language))
++    result.append_text(syntax.highlight(code))
++    if not result.plain.endswith("\n"):
++        result.append("\n")
++    return result
++
++
++def map_fenced_prose(text: str, transform) -> str:
++    """Apply display scrubbing outside fences without changing saved/copied code."""
++    parser = FenceParser()
++    parts: list[str] = []
++    prose: list[str] = []
++
++    def flush(before_fence=False):
++        if prose:
++            original = "".join(prose)
++            cleaned = transform(original)
++            if cleaned and before_fence and original.endswith("\n"):
++                cleaned += "\n"
++            parts.append(cleaned)
++            prose.clear()
++
++    for line in text.splitlines(keepends=True):
++        kind, _ = parser.push(line)
++        parser.lines.clear()
++        if kind == "prose":
++            prose.append(line)
++        else:
++            flush(before_fence=True)
++            parts.append(line)
++    flush()
++    return "".join(parts)
++
++
++def code_block_ansi(block: CodeBlock) -> str:
++    """Render once without inserted wraps; the terminal supplies soft wrapping."""
++    rendered = render_code_block(block)
++    output = StringIO()
++    # Never truncate a source line to the current window width.
++    width = max(1, *(Text(line).cell_len for line in rendered.plain.splitlines()))
++    console = Console(file=output, width=width, force_terminal=True, color_system="truecolor")
++    from rich.segment import Segment, Segments
++    # Text.__rich_console__ expands tabs even with soft_wrap=True. Its public
++    # segment renderer preserves them. The emulator may still expand selection
++    # into spaces, so /copy remains the raw-source copy path.
++    segments = []
++    for segment in rendered.render(console):
++        lines = segment.text.split("\n")
++        for index, line in enumerate(lines):
++            if index:
++                segments.append(Segment.line())  # newline after any style reset
++            if line:
++                segments.append(Segment(line, segment.style))
++    console.print(Segments(segments), end="", soft_wrap=True)
++    return output.getvalue()
++
++
++def code_highlighting_enabled() -> bool:
++    """Use the shared config for final/restored rendering, whose callers have no CLI instance."""
++    from cli import CLI_CONFIG
++    return CLI_CONFIG.get("display", {}).get("code_highlighting", False) is True
+diff --git a/hermes_cli/cli_init_mixin.py b/hermes_cli/cli_init_mixin.py
+index 6ffa60589b..280af21607 100644
+--- a/hermes_cli/cli_init_mixin.py
++++ b/hermes_cli/cli_init_mixin.py
+@@ -113,6 +113,13 @@ def lease_handed_over(cli, held):
+ class CLIInitMixin:
+     """HermesCLI constructor phases: display options, model/provider routing, turn limits, toolsets, checkpoints, prompt/reasoning, runtime state, session store and UI state."""
+ 
++    def _display_resumed_history(self):
++        """Opt-in recap renderer; preserve the existing recap when highlighting is off."""
++        if not getattr(self, "code_highlighting", False):
++            return super()._display_resumed_history()
++        from hermes_cli.cli_render import _display_highlighted_resumed_history
++        return _display_highlighted_resumed_history(self)
++
+     def _init_display_options(self, verbose, compact):
+         """Display-related config: compact/tool-progress/focus view, bells, streaming, previews, stream buffers."""
+         from cli import CLI_CONFIG, _configure_output_history, _int_or
+@@ -160,6 +167,7 @@ class CLIInitMixin:
+         self.timestamp_format = display.get("timestamp_format", "%H:%M")
+         _frm = str(display.get("final_response_markdown", "strip")).strip().lower()
+         self.final_response_markdown = _frm if _frm in {"render", "strip", "raw"} else "strip"
++        self.code_highlighting = display.get("code_highlighting", False) is True
+ 
+         self._inline_diffs_enabled = display.get("inline_diffs", True)
+ 
+diff --git a/hermes_cli/cli_modern_layout.py b/hermes_cli/cli_modern_layout.py
+index c94746d86f..5ca778ed77 100644
+--- a/hermes_cli/cli_modern_layout.py
++++ b/hermes_cli/cli_modern_layout.py
+@@ -295,7 +295,14 @@ def top_rule_fragments(cli) -> list:
+             if extra:
+                 left.append(("class:status-bar-dim bg:default", f" · {extra}"))
+         left.append((rule, " "))
+-    title = cli._get_status_bar_session_title()
++    # The ported cost badge (display.status_bar.right_badge=cost) replaces the far-right
++    # auto title, honoring the same display.status_bar.fields gate as the classic bar;
++    # _status_bar_right_badge's cost branch never reads the snapshot, so {} stays cheap
++    # on this per-frame render.
++    if cli._status_bar_right_badge_mode() == "cost":
++        title = cli._status_bar_right_badge({}, cli._get_status_bar_field_set())
++    else:
++        title = cli._get_status_bar_session_title()
+     right = [(rule, " "), (f"fg:{_skin_hex('ui_label', '#DAA520')}", title), (rule, " ─")] if title else []
+     used = sum(cli._status_bar_display_width(text) for _, text in left + right)
+     if used >= width:
+diff --git a/hermes_cli/cli_render.py b/hermes_cli/cli_render.py
+index f52ab7c294..782586fce6 100644
+--- a/hermes_cli/cli_render.py
++++ b/hermes_cli/cli_render.py
+@@ -37,6 +37,13 @@ _TOOL_CALL_TAGS = ("tool_call", "tool_calls", "tool_result", "function_call", "f
+ 
+ 
+ def _strip_reasoning_tags(text: str) -> str:
++    from hermes_cli.cli_code_blocks import code_highlighting_enabled, map_fenced_prose, strip_fenced_reasoning
++    if code_highlighting_enabled():
++        return map_fenced_prose(strip_fenced_reasoning(text), _strip_prose_reasoning_tags)
++    return _strip_prose_reasoning_tags(text)
++
++
++def _strip_prose_reasoning_tags(text: str) -> str:
+     """Strip reasoning blocks (closed, unterminated, orphan-close) and leaked tool-call XML from display text.
+ 
+     Keep in sync with ``agent.agent_runtime_helpers.strip_think_blocks`` and the stream consumer's think-tag sets.
+@@ -432,6 +439,36 @@ def _terminal_width_for_streaming() -> int:
+ 
+ 
+ def _render_final_assistant_content(text: str, mode: str = "render"):
++    from hermes_cli.cli_code_blocks import (
++        CodeBlock, code_highlighting_enabled, render_code_block, split_fenced_code,
++        strip_fenced_reasoning)
++    from rich.console import Group
++    from tools.ansi_strip import sanitize_display_text
++    if code_highlighting_enabled():
++        text = sanitize_display_text(strip_fenced_reasoning(text or ""))
++        parts = list(split_fenced_code(text))
++        if not any(isinstance(part, CodeBlock) for part in parts):
++            return _render_final_prose(text, mode)
++        pieces = []
++        for index, part in enumerate(parts):
++            if isinstance(part, CodeBlock):
++                pieces.append(render_code_block(part))
++            else:
++                rendered = _render_final_prose(part, mode)
++                if (isinstance(rendered, _RichText) and part.endswith("\n")
++                        and index < len(parts) - 1 and str(mode).strip().lower() == "strip"):
++                    rendered.append("\n")
++                pieces.append(rendered)
++        if str(mode or "render").strip().lower() in {"strip", "raw"}:
++            result = _RichText()
++            for piece in pieces:
++                result.append_text(piece)
++            return result
++        return Group(*pieces)
++    return _render_final_prose(text, mode)
++
++
++def _render_final_prose(text: str, mode: str = "render"):
+     """Render final assistant content as markdown, stripped text, or raw text."""
+     from cli import _preserve_windows_dot_segments_for_markdown, _rich_text_from_ansi, _strip_markdown_syntax, _terminal_columns, realign_markdown_tables
+     from rich.markdown import Markdown
+@@ -453,6 +490,46 @@ def _render_final_assistant_content(text: str, mode: str = "render"):
+     return Markdown(plain)
+ 
+ 
++def _display_highlighted_resumed_history(cli_instance):
++    """Use the final-content renderer for assistant bodies in the restored recap."""
++    from cli import CLI_CONFIG, _record_output_history_entry, _strip_reasoning_tags, _suspend_output_history
++    from hermes_cli.cli_agent_setup_mixin import _collect_resume_entries, _resume_panel_colors
++    from rich.console import Group
++    from rich.panel import Panel
++    from tools.ansi_strip import sanitize_display_text
++
++    history = getattr(cli_instance, "_resume_display_history", cli_instance.conversation_history)
++    if not history or cli_instance.resume_display == "minimal":
++        return
++    display = CLI_CONFIG.get("display", {})
++    entries, last_index, last_full = _collect_resume_entries(
++        history, display, lambda text: sanitize_display_text(_strip_reasoning_tags(text)))
++    if not entries:
++        return
++    skipped = max(0, len(entries) - int(display.get("resume_exchanges", 10)) * 2)
++    entries = entries[skipped:]
++    if last_index is not None and last_full and 0 <= last_index - skipped < len(entries):
++        entries[last_index - skipped] = ("assistant_last", last_full)
++    body_color, label_color, border_color, assistant_color = _resume_panel_colors()
++    pieces = []
++    if skipped:
++        pieces.append(_RichText(t("cli.resume.earlier_messages", count=skipped), style="dim italic"))
++    for role, text in entries:
++        if role == "event":
++            pieces.append(_RichText("◈ " + text, style="dim italic"))
++        elif role == "user":
++            pieces.append(_RichText(t("cli.resume.label_you") + " " + text, style="dim"))
++        else:
++            pieces.append(_RichText(t("cli.resume.label_assistant", agent_name="Hermes"),
++                                    style=f"bold {assistant_color}"))
++            pieces.append(_render_final_assistant_content(text, cli_instance.final_response_markdown))
++    panel = Panel(Group(*pieces), title=t("cli.resume.panel_title"),
++                  border_style=f"dim {border_color}", padding=(0, 0), style=body_color)
++    _record_output_history_entry(lambda: cli_instance._render_resume_history_panel_lines(panel))
++    with _suspend_output_history():
++        cli_instance._console_print(panel)
++
++
+ def _post_stream_transform_output(response: str, result: dict | None) -> str:
+     """Text still to display after a streamed response transform: the suffix, or the whole response when replaced."""
+     if not result or not result.get("response_transformed"):
+diff --git a/hermes_cli/cli_status_bar_mixin.py b/hermes_cli/cli_status_bar_mixin.py
+index 14dbe60293..c291db2c3f 100644
+--- a/hermes_cli/cli_status_bar_mixin.py
++++ b/hermes_cli/cli_status_bar_mixin.py
+@@ -8,6 +8,7 @@ inside each method (``from cli import ...``) — never at module load time (impo
+ from __future__ import annotations
+ 
+ import errno
++import math
+ import shutil
+ import threading
+ import time
+@@ -397,6 +398,139 @@ class CLIStatusBarMixin:
+         snapshot["avg_velocity_label"] = t("cli.status_bar.velocity_label", value=f"{avg_vel:.0f}") if avg_vel is not None else ""
+         return snapshot
+ 
++    def _status_bar_right_badge_mode(self) -> str:
++        """Cost is opt-in; shared installs keep other profiles' title badges."""
++        from cli import CLI_CONFIG
++        display = CLI_CONFIG.get("display", {}) if isinstance(CLI_CONFIG, dict) else {}
++        status = display.get("status_bar", {}) if isinstance(display, dict) else {}
++        return "cost" if isinstance(status, dict) and status.get("right_badge") == "cost" else "title"
++
++    @staticmethod
++    def _status_bar_cost_label(rows: list[dict]) -> str:
++        """Use recorded dollars, never reprice mixed-model tokens at today's model rate.
++
++        cost_coverage tracks missing reports without changing the legacy last-call
++        cost_status. NULL coverage on persisted history is not a complete total.
++        Actual subtotals are exact only for a single accounted call.
++        """
++        total = 0.0
++        exact = True
++        calls = 0
++        for row in rows:
++            try:
++                count = int(row.get("api_call_count") or 0)
++            except (TypeError, ValueError, OverflowError):
++                return "Session cost unavailable"
++            if count < 0:
++                return "Session cost unavailable"
++            status = row.get("cost_status")
++            estimate = row.get("estimated_cost_usd")
++            actual = row.get("actual_cost_usd")
++            has_usage = count or any(row.get(k) for k in (
++                "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens"))
++            if not has_usage and estimate is None and actual is None:
++                continue
++            coverage = row.get("cost_coverage")
++            if "cost_coverage" in row and coverage not in {"complete", "actual_only"}:
++                return "Session cost unavailable"
++            if count != 1 and coverage != "complete":
++                # Resume-local multi-call totals have no persistent coverage evidence.
++                return "Session cost unavailable"
++            if status not in {"actual", "estimated", "included"}:
++                return "Session cost unavailable"
++            # Zero in the model ledger is also the default for missing actual cost.
++            use_actual = status == "actual" and count == 1 and actual is not None
++            amount = actual if use_actual else (0 if status == "included" and estimate is None else estimate)
++            try:
++                amount = float(amount)
++            except (TypeError, ValueError, OverflowError):
++                return "Session cost unavailable"
++            if not math.isfinite(amount) or amount < 0:
++                return "Session cost unavailable"
++            if status == "estimated" and amount == 0:
++                # The persisted schema coalesces a missing estimate to zero. Only an
++                # explicit included/actual result proves a zero-dollar conversation.
++                return "Session cost unavailable"
++            if status == "actual" and not use_actual and amount == 0:
++                return "Session cost unavailable"
++            total += amount
++            if not math.isfinite(total):
++                return "Session cost unavailable"
++            calls += count
++            exact = exact and (use_actual or status == "included" and count == 1 and amount == 0)
++        if not calls and not total:
++            return "Session cost unavailable"
++        from agent.usage_pricing import cost_subprecision_text
++
++        dollars = cost_subprecision_text(total, 4) or f"${total:.4f}"
++        return f"Session cost {'~' if not exact else ''}{dollars}"
++
++    def _get_status_bar_session_cost(self) -> str:
++        """Conversation-only accounting, including persisted resume/compression usage.
++
++        DB reads are TTL-cached, and never query account limits or change saved titles.
++        Live agent totals are a fallback only: they reset on resume/model recreation.
++        """
++        agent = getattr(self, "agent", None)
++        session_id = str(getattr(agent, "session_id", None) or getattr(self, "session_id", "") or "")
++        db = getattr(self, "_session_db", None) or getattr(agent, "_session_db", None)
++        if db is not None and session_id:
++            now = time.monotonic()
++            key = (id(db), session_id)
++            cached = getattr(self, "_status_bar_cost_cache", None)
++            if cached and cached[0] == key and now - cached[1] < 1.5:
++                return cached[2]
++            try:
++                # Do not force the token writer to drain on the UI repaint thread.
++                # The next TTL read sees its committed deltas.
++                chain = db._session_lineage_root_to_tip(session_id)
++                sessions = [dict(r) for r in db._read_all(
++                    f"SELECT * FROM sessions WHERE id IN ({','.join('?' for _ in chain)})", chain)]
++                by_id = {row["id"]: row for row in sessions}
++                ids = [session_id]
++                current = by_id.get(session_id)
++                while current and not db._is_explicit_fork_child_row(current, include_reset=True):
++                    parent = by_id.get(current.get("parent_session_id"))
++                    if not parent or parent.get("end_reason") != "compression" or parent["id"] in ids:
++                        break
++                    ids.append(parent["id"])
++                    current = parent
++                rows = [by_id[sid] for sid in ids if sid in by_id]
++                for row in rows:
++                    row.setdefault("cost_coverage", None)
++                routes = [dict(r) for r in db._read_all(
++                    f"SELECT * FROM session_model_usage WHERE session_id IN ({','.join('?' for _ in ids)})", ids)]
++                # A task name does not mean auxiliary-only: voice_chat already updates
++                # the summary. Persist the writer's ownership instead of adding it twice.
++                aux = [row for row in routes if row.get("summary_included") == 0]
++                for row in aux:
++                    row["cost_status"] = "estimated" if row.get("estimated_cost_usd") else "unknown"
++                if any(row.get("summary_included") is None or
++                       row.get("cost_coverage") not in {"complete", "actual_only"} for row in routes):
++                    label = "Session cost unavailable"
++                else:
++                    label = self._status_bar_cost_label(rows + aux)
++                self._status_bar_cost_cache = (key, now, label)
++                return label
++            except Exception:
++                # A broken persisted read cannot safely fall back to resume-local totals.
++                return "Session cost unavailable"
++        if agent is None:
++            return "Session cost unavailable"
++        return self._status_bar_cost_label([{
++            "api_call_count": getattr(agent, "session_api_calls", 0),
++            "estimated_cost_usd": getattr(agent, "session_estimated_cost_usd", None),
++            "actual_cost_usd": getattr(agent, "session_actual_cost_usd", None),
++            "cost_status": getattr(agent, "session_cost_status", "unknown"),
++            **{k: getattr(agent, f"session_{k}", 0) for k in (
++                "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")},
++        }])
++
++    def _status_bar_right_badge(self, snapshot: dict, field_set) -> str:
++        if self._status_bar_right_badge_mode() == "cost":
++            return self._get_status_bar_session_cost() if field_set is None or "cost" in field_set else ""
++        return (snapshot.get("session_title") or "") if field_set is None or "title" in field_set else ""
++
+     def _get_status_bar_session_title(self) -> str:
+         """Current title, polling state.db at most every 1.5s (not on every repaint)."""
+         pending = str(getattr(self, "_pending_title", None) or "").strip()
+@@ -450,10 +584,15 @@ class CLIStatusBarMixin:
+         return "".join(out).rstrip() + "..."
+ 
+     @classmethod
+-    def _status_title_badge(cls, title: str, width: int) -> tuple[str, int] | None:
++    def _status_title_badge(cls, title: str, width: int, *, cost: bool = False) -> tuple[str, int] | None:
+         """(badge, left_width) for the far-right session-title badge, or None when it
+         doesn't fit (no title / bar narrower than 24 cells)."""
+         title = str(title or "").strip()
++        if cost and title:
++            badge = f" {title} "
++            suffix_width = cls._status_bar_display_width(" ─" + badge)
++            # Never clip precision or the unavailable/estimate qualifier.
++            return (badge, width - suffix_width) if width >= suffix_width + 6 else None
+         if not title or width < 24:
+             return None
+         title_width = max(6, min(30, width // 3))
+@@ -462,9 +601,9 @@ class CLIStatusBarMixin:
+         return badge, max(0, width - suffix_width)
+ 
+     @classmethod
+-    def _right_align_status_title(cls, text: str, title: str, width: int) -> str:
++    def _right_align_status_title(cls, text: str, title: str, width: int, *, cost: bool = False) -> str:
+         """Pin a bounded session-title badge to the far-right status-bar edge."""
+-        placed = cls._status_title_badge(title, width)
++        placed = cls._status_title_badge(title, width, cost=cost)
+         if placed is None:
+             return cls._trim_status_bar_text(text, width)
+         badge, left_width = placed
+@@ -473,16 +612,12 @@ class CLIStatusBarMixin:
+         return f"{left}{padding} ─{badge}"
+ 
+     @classmethod
+-    def _right_align_status_title_fragments(cls, frags, title: str, width: int):
+-        """Styled counterpart to :meth:`_right_align_status_title`."""
+-        placed = cls._status_title_badge(title, width)
+-        if placed is None:
+-            return frags
+-        badge, left_width = placed
++    def _trim_status_bar_fragments(cls, frags, width: int):
++        """Clip styled fragments without discarding styles on the surviving text."""
+         trimmed = []
+         used = 0
+         for style, value in frags:
+-            remaining = left_width - used
++            remaining = width - used
+             if remaining <= 0:
+                 break
+             value_width = cls._status_bar_display_width(value)
+@@ -495,6 +630,16 @@ class CLIStatusBarMixin:
+                 trimmed.append((style, clipped))
+                 used += cls._status_bar_display_width(clipped)
+             break
++        return trimmed, used
++
++    @classmethod
++    def _right_align_status_title_fragments(cls, frags, title: str, width: int, *, cost: bool = False):
++        """Styled counterpart to :meth:`_right_align_status_title`."""
++        placed = cls._status_title_badge(title, width, cost=cost)
++        if placed is None:
++            return frags
++        badge, left_width = placed
++        trimmed, used = cls._trim_status_bar_fragments(frags, left_width)
+         if used < left_width:
+             trimmed.append((_DIM, " " * (left_width - used)))
+         trimmed.extend([(_DIM, " ─"), ("class:status-bar-session-title", badge)])
+@@ -996,7 +1141,7 @@ class CLIStatusBarMixin:
+ 
+         Fields: model, context_detail, context_pct, cache_hit, latency, tps, compressions,
+         bg_tasks, bg_processes, bg_subagents, goal, git_branch (opt-in only), duration,
+-        prompt_elapsed, idle_since, focus, yolo, stash, battery, title, total_tokens
++        prompt_elapsed, idle_since, focus, yolo, stash, battery, title, cost, total_tokens
+         (opt-in only). Order is fixed; the config controls visibility only.
+         """
+         from cli import CLI_CONFIG
+@@ -1108,14 +1253,13 @@ class CLIStatusBarMixin:
+     def _build_status_bar_text(self, width: Optional[int] = None) -> str:
+         """Compact one-line session status string for the TUI footer."""
+         try:
+-            snapshot = self._get_status_bar_snapshot()
+             if width is None:
+                 width = self._get_tui_terminal_width()
++            snapshot = self._get_status_bar_snapshot()
+             model_short = snapshot["model_short"]
+             battery_label = snapshot.get("battery_label") or ""
+             field_set = self._get_status_bar_field_set()
+-            show_title = field_set is None or "title" in field_set
+-            session_title = (snapshot.get("session_title") or "") if show_title else ""
++            session_title = self._status_bar_right_badge(snapshot, field_set)
+             segs = self._status_bar_segments(
+                 snapshot, width, field_set, self._is_session_yolo_active(), styled=False)
+             parts = ["".join(t for _, t in seg) for seg in segs] or [f"☤ {model_short}"]
+@@ -1126,9 +1270,22 @@ class CLIStatusBarMixin:
+                 text = f"{parts[0]} │ " + " · ".join(parts[1:]) if battery_label else " · ".join(parts)
+             else:
+                 text = (" · " if width < 76 else " │ ").join(parts)
+-            return self._right_align_status_title(text, session_title, width)
++            return self._right_align_status_title(
++                text, session_title, width, cost=self._status_bar_right_badge_mode() == "cost")
+         except Exception:
+-            return f"☤ {self.model if getattr(self, 'model', None) else 'Hermes'}"
++            width = width if width is not None else 80
++            text = f"☤ {getattr(self, 'model', None) or 'Hermes'}"
++            badge = self._status_bar_right_badge({}, self._get_status_bar_field_set())
++            vim_label = self._vim_mode_label()
++            if vim_label:
++                placed = self._status_title_badge(badge, width, cost=self._status_bar_right_badge_mode() == "cost")
++                left_width = placed[1] if placed else width
++                suffix = f" │ {vim_label}"
++                suffix_width = self._status_bar_display_width(suffix)
++                if left_width > suffix_width:
++                    text = self._trim_status_bar_text(text, left_width - suffix_width) + suffix
++            return self._right_align_status_title(
++                text, badge, width, cost=self._status_bar_right_badge_mode() == "cost")
+ 
+     def _get_status_bar_fragments(self):
+         if (
+@@ -1140,16 +1297,16 @@ class CLIStatusBarMixin:
+             from hermes_cli.cli_modern_layout import status_line_fragments
+             return status_line_fragments(self)
+         try:
+-            snapshot = self._get_status_bar_snapshot()
+             # prompt_toolkit's own width: shutil's can be stale (esp. over SSH) and an overflow
+             # produces duplicated status-bar rows over long sessions.
+             width = self._get_tui_terminal_width()
++            snapshot = self._get_status_bar_snapshot()
+             field_set = self._get_status_bar_field_set()
+ 
+             def _ok(name: str) -> bool:
+                 return field_set is None or name in field_set
+ 
+-            session_title = (snapshot.get("session_title") or "") if _ok("title") else ""
++            session_title = self._status_bar_right_badge(snapshot, field_set)
+             segs = self._status_bar_segments(
+                 snapshot, width, field_set, self._is_session_yolo_active(), styled=True)
+             sep = " · " if width < 76 else " │ "
+@@ -1173,17 +1330,30 @@ class CLIStatusBarMixin:
+                 battery_style = self._battery_status_style(snapshot.get("battery_category", "dim"))
+                 frags[0:0] = [(_SB, " "), (battery_style, battery_label), (_DIM, " │")]
+ 
+-            frags = self._right_align_status_title_fragments(frags, session_title, width)
+             vim_label = self._vim_mode_label()
++            if self._status_bar_right_badge_mode() != "cost":
++                frags = self._right_align_status_title_fragments(frags, session_title, width)
+             if vim_label:
+-                frags.extend([(_DIM, " │ "), (_STRONG, vim_label), (_SB, " ")])
++                vim_frags = [(_DIM, " │ "), (_STRONG, vim_label), (_SB, " ")]
++                if self._status_bar_right_badge_mode() == "cost":
++                    placed = self._status_title_badge(session_title, width, cost=True)
++                    left_width = placed[1] if placed else width
++                    vim_width = sum(self._status_bar_display_width(value) for _, value in vim_frags)
++                    if left_width >= vim_width + 1:
++                        # Reserve the mode before trimming lower-priority left segments.
++                        frags, _ = self._trim_status_bar_fragments(frags, left_width - vim_width)
++                        frags.extend(vim_frags)
++                else:
++                    frags.extend(vim_frags)
++            if self._status_bar_right_badge_mode() == "cost":
++                frags = self._right_align_status_title_fragments(frags, session_title, width, cost=True)
+             total_width = sum(self._status_bar_display_width(text) for _, text in frags)
+             if total_width > width:
+                 plain_text = "".join(text for _, text in frags)
+                 return [(_SB, self._trim_status_bar_text(plain_text, width))]
+             return frags
+         except Exception:
+-            return [(_SB, f" {self._build_status_bar_text()} ")]
++            return [(_SB, self._build_status_bar_text(locals().get("width", 80)))]
+ 
+     # ── prompt stash panel ────────────────────────────────────────────────────
+ 
+diff --git a/hermes_cli/cli_stream_mixin.py b/hermes_cli/cli_stream_mixin.py
+index 12c7e37cae..8fc7d1b4b7 100644
+--- a/hermes_cli/cli_stream_mixin.py
++++ b/hermes_cli/cli_stream_mixin.py
+@@ -349,6 +349,58 @@ class CLIStreamMixin:
+             self._release_held_status_lines()
+ 
+     def _stream_delta(self, text) -> None:
++        """Recognize fences before the reasoning filter can consume literal code tags."""
++        if not getattr(self, "code_highlighting", False) or text is None:
++            self._filter_stream_delta(text)
++            return
++        from hermes_cli.cli_code_blocks import FenceParser, fence_opening_possible
++        if not hasattr(self, "_code_prefilter"):
++            self._code_prefilter = FenceParser()
++        self._code_prefilter_buf = getattr(self, "_code_prefilter_buf", "") + (text or "")
++        while "\n" in self._code_prefilter_buf:
++            line, self._code_prefilter_buf = self._code_prefilter_buf.split("\n", 1)
++            line += "\n"
++            prose_line = getattr(self, "_code_prefilter_prose", False)
++            self._code_prefilter_prose = False
++            if prose_line or getattr(self, "_in_reasoning_block", False):
++                self._filter_stream_delta(line)
++                self._sync_code_prefilter()
++                continue
++            kind, _ = self._code_prefilter.push(line)
++            self._code_prefilter.lines.clear()  # scanner only; renderer owns the source
++            if kind != "prose":
++                pending = getattr(self, "_stream_prefilt", "")
++                if pending:
++                    self._emit_stream_text(pending)
++                    self._stream_prefilt = ""
++                self._stream_started = True
++                self._emit_stream_text(line)
++                self._stream_last_was_newline = True
++            else:
++                self._filter_stream_delta(line)
++                self._sync_code_prefilter()
++        pending = self._code_prefilter_buf
++        if (pending and not self._code_prefilter.in_code
++                and (getattr(self, "_code_prefilter_prose", False)
++                     or getattr(self, "_in_reasoning_block", False)
++                     or not fence_opening_possible(pending))):
++            # Once this physical line is known to be prose, feed partial deltas
++            # immediately. Keep that decision until its newline, not just until
++            # the next delta, which could itself look like an opening fence.
++            self._code_prefilter_buf = ""
++            self._code_prefilter_prose = True
++            self._filter_stream_delta(pending)
++            self._sync_code_prefilter()
++
++    def _sync_code_prefilter(self) -> None:
++        # A reasoning close tag can precede the opener on the same physical line.
++        # The display parser sees that opener after reasoning was removed.
++        parser = getattr(self, "_stream_code_parser", None)
++        if parser:
++            self._code_prefilter.fence = parser.fence
++            self._code_prefilter.language = parser.language
++
++    def _filter_stream_delta(self, text) -> None:
+         """Line-buffered streaming callback for real-time token rendering.
+ 
+         Emits complete lines via _cprint (reliable under prompt_toolkit's patch_stdout);
+@@ -390,6 +442,8 @@ class CLIStreamMixin:
+                             self._emit_stream_text(preceding)
+                             self._stream_last_was_newline = preceding.endswith("\n")
+                         self._in_reasoning_block = True
++                        if getattr(self, "code_highlighting", False):
++                            self._stream_reasoning_stack = [tag_lower[1:-1]]
+                         self._stream_prefilt = self._stream_prefilt[idx + len(tag):]
+                         break
+                     search_start = idx + 1
+@@ -411,6 +465,42 @@ class CLIStreamMixin:
+                     self._stream_prefilt = self._stream_prefilt[len(safe):]
+                 return
+ 
++        if (getattr(self, "code_highlighting", False)
++                and getattr(self, "_in_reasoning_block", False)):
++            # Nested or mismatched closers must not release the outer hidden block.
++            stack = self._stream_reasoning_stack
++            tokens = (*_OPEN_TAGS, *_CLOSE_TAGS)
++            while self._stream_prefilt:
++                lowered = self._stream_prefilt.lower()
++                matches = [(lowered.find(tag.lower()), tag) for tag in tokens
++                           if lowered.find(tag.lower()) >= 0]
++                if not matches:
++                    hold = max((size for tag in tokens for size in range(1, len(tag))
++                                if lowered.endswith(tag.lower()[:size])), default=0)
++                    safe = self._stream_prefilt[:-hold] if hold else self._stream_prefilt
++                    if self.show_reasoning and safe:
++                        self._stream_reasoning_delta(safe)
++                    self._stream_prefilt = self._stream_prefilt[-hold:] if hold else ""
++                    return
++                index, tag = min(matches, key=lambda item: item[0])
++                inner = self._stream_prefilt[:index]
++                if self.show_reasoning and inner:
++                    self._stream_reasoning_delta(inner)
++                self._stream_prefilt = self._stream_prefilt[index + len(tag):]
++                name = tag.lower().strip("</>")
++                if tag.startswith("</"):
++                    if stack and stack[-1] == name:
++                        stack.pop()
++                else:
++                    stack.append(name)
++                if not stack:
++                    self._in_reasoning_block = False
++                    after, self._stream_prefilt = self._stream_prefilt, ""
++                    if after:
++                        self._filter_stream_delta(after)
++                    return
++            return
++
+         # Inside a reasoning block — look for a close tag; keep accumulating because close tags
+         # can arrive split across tokens ("</REASONING_SCRATCH" + "PAD>...").
+         if getattr(self, "_in_reasoning_block", False):
+@@ -426,7 +516,7 @@ class CLIStreamMixin:
+                     after = self._stream_prefilt[idx + len(tag):]
+                     self._stream_prefilt = ""
+                     if after:  # re-filter: the remainder could contain another open tag
+-                        self._stream_delta(after)
++                        self._filter_stream_delta(after)
+                     return
+             # Stream reasoning live when show_reasoning is on; keep only a possible partial
+             # close-tag tail.
+@@ -436,6 +526,27 @@ class CLIStreamMixin:
+                 self._stream_prefilt = self._stream_prefilt[-_MAX_CLOSE_TAG_LEN:]
+             return
+ 
++    def _consume_stream_code_line(self, line: str) -> bool:
++        if not getattr(self, "code_highlighting", False):
++            return False
++        from hermes_cli.cli_code_blocks import FenceParser
++        if not hasattr(self, "_stream_code_parser"):
++            self._stream_code_parser = FenceParser()
++        kind, block = self._stream_code_parser.push(line)
++        if kind == "prose":
++            return False
++        if getattr(self, "_stream_table_buf", None):
++            self._flush_stream_table_buf()
++        if kind == "block":
++            self._emit_stream_code_block(block)
++        return True
++
++    def _emit_stream_code_block(self, block) -> None:
++        from cli import _cprint
++        from hermes_cli.cli_code_blocks import code_block_ansi
++        # _cprint supplies the final newline; avoid adding a blank row at every block.
++        _cprint(code_block_ansi(block).removesuffix("\n"))
++
+     def _emit_stream_line(self, printed_line: str) -> None:
+         """Print one response line with the skin's true-color text escape (if any)."""
+         from cli import _RST, _STREAM_PAD, _cprint
+@@ -508,6 +619,8 @@ class CLIStreamMixin:
+         self._stream_buf += text
+         while "\n" in self._stream_buf:
+             line, self._stream_buf = self._stream_buf.split("\n", 1)
++            if self._consume_stream_code_line(line + "\n"):
++                continue
+             # Table rows are held and re-padded as a block once it ends (already-printed rows
+             # can't be re-aligned), so a table appears in one batch when the block closes.
+             if self._in_stream_table:
+@@ -529,6 +642,7 @@ class CLIStreamMixin:
+         if (
+             self._stream_buf
+             and not self._in_stream_table
++            and not (getattr(self, "_stream_code_parser", None) and self._stream_code_parser.in_code)
+             and not self._stream_buf.lstrip().startswith("|")
+             and len(self._stream_buf) >= 80):
+             preview = self._stream_buf[-int(_STREAM_PARTIAL_PREVIEW_LEN):]
+@@ -545,12 +659,32 @@ class CLIStreamMixin:
+         """Emit any remaining partial line from the stream buffer and close the box."""
+         from agent.markdown_tables import is_table_divider, looks_like_table_row
+         from cli import _ACCENT, _RST, _cprint, _strip_markdown_syntax
+-        # Still inside a "reasoning block" at end-of-stream = false positive (the model
+-        # mentioned a tag in prose and never closed it): recover the buffer as regular text.
+-        if getattr(self, "_in_reasoning_block", False) and getattr(self, "_stream_prefilt", ""):
+-            self._in_reasoning_block = False
++        pending = getattr(self, "_code_prefilter_buf", "")
++        self._code_prefilter_buf = ""
++        if pending:
++            if getattr(self, "_code_prefilter", None) and self._code_prefilter.in_code:
++                self._emit_stream_text(pending)
++            else:
++                self._filter_stream_delta(pending)
++        if not getattr(self, "_in_reasoning_block", False) and getattr(self, "_stream_prefilt", ""):
+             self._emit_stream_text(self._stream_prefilt)
+             self._stream_prefilt = ""
++        if self._stream_buf and self._consume_stream_code_line(self._stream_buf):
++            self._stream_buf = ""
++        parser = getattr(self, "_stream_code_parser", None)
++        if parser and parser.in_code:
++            self._emit_stream_code_block(parser.finish())
++        if getattr(self, "_in_reasoning_block", False):
++            pending = getattr(self, "_stream_prefilt", "")
++            # In fenced mode, an unterminated reasoning block stays hidden just
++            # as it does in final/copy/resume. Keep the legacy fallback otherwise.
++            if getattr(self, "code_highlighting", False):
++                if self.show_reasoning and pending:
++                    self._stream_reasoning_delta(pending)
++            elif pending:
++                self._emit_stream_text(pending)
++            self._in_reasoning_block = False
++            self._stream_prefilt = ""
+         self._close_reasoning_box()  # in case no content tokens arrived
+         # A trailing partial table row joins the table buffer so the whole block is re-aligned
+         # together (else the final row prints under-padded).
+@@ -579,11 +713,16 @@ class CLIStreamMixin:
+     def _reset_stream_state(self) -> None:
+         """Reset streaming state before each agent invocation."""
+         self._stream_buf = ""
++        self.__dict__.pop("_stream_code_parser", None)
++        self.__dict__.pop("_code_prefilter", None)
++        self._code_prefilter_buf = ""
++        self._code_prefilter_prose = False
+         self._stream_started = False
+         self._stream_box_opened = False
+         self._stream_text_ansi = ""
+         self._stream_prefilt = ""
+         self._in_reasoning_block = False
++        self._stream_reasoning_stack = []
+         self._stream_last_was_newline = True
+         self._reasoning_box_opened = False
+         self._reasoning_buf = ""
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index fca5362686..7ecfd6798d 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -883,6 +883,7 @@ DEFAULT_CONFIG = {
+         "timestamps": False,      # message timestamps (CLI labels, TUI rows, desktop transcript)
+         "timestamp_format": "%H:%M",  # strftime format, e.g. "%b-%d %H:%M"
+         "final_response_markdown": "strip",  # render | strip | raw
++        "code_highlighting": False,  # classic CLI fenced blocks, streaming and restored history
+         # Preserve recent classic-CLI output across Ctrl+L, /redraw and resize clears; disable if an
+         # emulator misbehaves with replayed scrollback.
+         "persistent_output": True,
+@@ -995,6 +996,7 @@ DEFAULT_CONFIG = {
+         # context_detail/prompt_elapsed/idle_since.
+         "status_bar": {
+             "fields": [],
++            "right_badge": "title",  # title | cost; cost uses this conversation's recorded usage
+         },
+         "copy_shortcut": "auto",  # "auto" (platform default) | ctrl_c | ctrl_shift_c | disabled
+         # Petdex animated mascot (github.com/crafter-station/petdex): cosmetic sprite across
+diff --git a/hermes_cli/gateway_session_store.py b/hermes_cli/gateway_session_store.py
+index 47f31528c6..759d44b971 100644
+--- a/hermes_cli/gateway_session_store.py
++++ b/hermes_cli/gateway_session_store.py
+@@ -35,6 +35,10 @@ _READS = frozenset({
+     "get_handoff_state", "get_meta", "get_compression_tip", "resolve_session_by_title", "get_messages",
+     "session_count", "sanitize_title", "session_yolo_enabled",
+     "get_session_model_config_value",
++    # The status-bar cost badge's raw reads (pure SELECTs over the lineage chain);
++    # without them the store's refused-stub raises and the badge degrades to a
++    # permanent "Session cost unavailable".
++    "_read_all", "_read_one", "_session_lineage_root_to_tip", "_is_explicit_fork_child_row",
+ })
+ # Writes the gateway already performs itself (persistence, accounting, maintenance).
+ _GATEWAY_OWNED = frozenset({
+diff --git a/hermes_cli/session_schema_history.py b/hermes_cli/session_schema_history.py
+index 0a23280869..157df29624 100644
+--- a/hermes_cli/session_schema_history.py
++++ b/hermes_cli/session_schema_history.py
+@@ -215,6 +215,8 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
+         )),
+         # GW-18 (package 10, #140968): write-side revision a transcript-derived cache keys on.
+         ('32 2026-10-18T10:11Z 1fc1999769', (('+', 'transcript_revision', 'tool_names'),)),
++        # Local TUI port (cost coverage provenance): tracked onto base 4d04303818.
++        ('33 2026-10-21T00:00Z local-port-4d04303818', (('+', 'cost_coverage', 'cost_status'),)),
+         ),
+     ),
+     "messages": _TableHistory(
+@@ -271,6 +273,11 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
+             ('+', 'cost_source', 'cost_status'),
+         )),
+         ('02 2026-07-16T11:23Z eb6aa03609', (('+', 'task', 'billing_mode'),)),
++        # Local TUI port (cost coverage + writer ownership): tracked onto base 4d04303818.
++        ('03 2026-10-21T00:00Z local-port-4d04303818', (
++            ('+', 'cost_coverage', 'cost_status'),
++            ('+', 'summary_included', 'cost_coverage'),
++        )),
+         ),
+     ),
+ }
+diff --git a/hermes_state_common.py b/hermes_state_common.py
+index c31526f02c..084a24f354 100644
+--- a/hermes_state_common.py
++++ b/hermes_state_common.py
+@@ -497,6 +497,7 @@ CREATE TABLE IF NOT EXISTS sessions (
+     estimated_cost_usd REAL,
+     actual_cost_usd REAL,
+     cost_status TEXT,
++    cost_coverage TEXT,
+     cost_source TEXT,
+     pricing_version TEXT,
+     title TEXT,
+@@ -577,6 +578,8 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
+     estimated_cost_usd REAL NOT NULL DEFAULT 0,
+     actual_cost_usd REAL NOT NULL DEFAULT 0,
+     cost_status TEXT,
++    cost_coverage TEXT,
++    summary_included INTEGER,
+     cost_source TEXT,
+     first_seen REAL,
+     last_seen REAL,
+diff --git a/hermes_state_schema.py b/hermes_state_schema.py
+index c83e6b2156..b8a1b41cdb 100644
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -91,6 +91,8 @@ _SESSION_MODEL_USAGE_HEAL_DDL = """CREATE TABLE session_model_usage (
+     estimated_cost_usd REAL NOT NULL DEFAULT 0,
+     actual_cost_usd REAL NOT NULL DEFAULT 0,
+     cost_status TEXT,
++    cost_coverage TEXT,
++    summary_included INTEGER,
+     cost_source TEXT,
+     first_seen REAL,
+     last_seen REAL,
+@@ -900,6 +902,11 @@ class SessionSchemaMixin:
+             "session_model_usage has legacy primary key %r (missing task); rebuilding with composite 6-column key",
+             sorted(pk_cols),
+         )
++        columns = {row[1] for row in cursor.execute('PRAGMA table_info("session_model_usage")')}
++        # Direct heal callers can predate reconciliation. Missing metadata stays
++        # unproven; existing values, including NULL, must survive unchanged.
++        coverage = "cost_coverage" if "cost_coverage" in columns else "NULL"
++        ownership = "summary_included" if "summary_included" in columns else "NULL"
+         cursor.execute("PRAGMA foreign_keys=OFF")
+         try:
+             self._rebuild_table(
+@@ -911,12 +918,12 @@ class SessionSchemaMixin:
+                 # INSERT OR IGNORE keeps it idempotent: if newer code already wrote a (session_id, model,
+                 # provider) row for a session, the PK conflict skips the stale aggregate rather than
+                 # doubling it.
+-                """INSERT OR IGNORE INTO session_model_usage (
++                f"""INSERT OR IGNORE INTO session_model_usage (
+                        session_id, model, billing_provider, billing_base_url,
+                        billing_mode, task, api_call_count, input_tokens,
+                        output_tokens, cache_read_tokens, cache_write_tokens,
+                        reasoning_tokens, estimated_cost_usd, actual_cost_usd,
+-                       cost_status, cost_source, first_seen, last_seen
++                       cost_status, cost_coverage, summary_included, cost_source, first_seen, last_seen
+                    )
+                    SELECT session_id, model,
+                           COALESCE(billing_provider, ''),
+@@ -926,7 +933,7 @@ class SessionSchemaMixin:
+                           api_call_count, input_tokens,
+                           output_tokens, cache_read_tokens, cache_write_tokens,
+                           reasoning_tokens, estimated_cost_usd, actual_cost_usd,
+-                          cost_status, cost_source, first_seen, last_seen
++                          cost_status, {coverage}, {ownership}, cost_source, first_seen, last_seen
+                    FROM session_model_usage_legacy_pk""",
+                 _SESSION_MODEL_USAGE_INDEX_SQL,
+             )
+diff --git a/hermes_state_usage.py b/hermes_state_usage.py
+index ca5474e285..2fe6896d0a 100644
+--- a/hermes_state_usage.py
++++ b/hermes_state_usage.py
+@@ -6,6 +6,7 @@ from __future__ import annotations
+ import atexit
+ import contextlib
+ import logging
++import math
+ import threading
+ import time
+ import weakref
+@@ -17,6 +18,43 @@ logger = logging.getLogger("hermes_state")
+ _TOKEN_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
+ 
+ 
++def _cost_coverage(status, estimate, actual, api_calls=1) -> str:
++    """Coverage of this report, separate from the legacy last-call cost_status."""
++    def valid(value, *, zero=False):
++        try:
++            amount = float(value)
++        except (TypeError, ValueError, OverflowError):
++            return False
++        return math.isfinite(amount) and (amount >= 0 if zero else amount > 0)
++
++    if status == "included":
++        return "complete" if all(v is None or v == 0 for v in (estimate, actual)) else "unknown"
++    if status in {"estimated", "actual"} and valid(estimate):
++        return "complete"
++    if status == "actual" and valid(actual, zero=True):
++        return "actual_only" if api_calls == 1 else "unknown"
++    return "unknown"
++
++
++def _merge_cost_coverage(previous, report, *, has_history) -> str:
++    if previous == "historical" or (previous is None and has_history):
++        return "historical"
++    if previous == "unknown" or report == "unknown":
++        return "unknown"
++    if has_history and "actual_only" in (previous, report):
++        return "unknown"
++    return report
++
++
++def _ledger_cost(value) -> float:
++    """Invalid dollars stay uncovered, but must not abort the NOT NULL ledger insert."""
++    try:
++        amount = float(value)
++    except (TypeError, ValueError, OverflowError):
++        return 0.0
++    return amount if math.isfinite(amount) and amount >= 0 else 0.0
++
++
+ def _token_update_sql(delta: bool) -> str:
+     """``UPDATE sessions`` for one usage report: *delta* adds to the stored counters (CLI
+     per-call path), otherwise sets them (gateway cumulative path). Cost/route columns
+@@ -54,8 +92,8 @@ _MODEL_USAGE_UPSERT_SQL = """INSERT INTO session_model_usage (
+                    task, api_call_count, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                    estimated_cost_usd, actual_cost_usd, cost_status, cost_source,
+-                   first_seen, last_seen
+-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                   first_seen, last_seen, cost_coverage, summary_included
++               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, model, billing_provider, billing_base_url, billing_mode, task)
+                DO UPDATE SET
+                    api_call_count = api_call_count + excluded.api_call_count,
+@@ -68,6 +106,16 @@ _MODEL_USAGE_UPSERT_SQL = """INSERT INTO session_model_usage (
+                    actual_cost_usd = actual_cost_usd + excluded.actual_cost_usd,
+                    cost_status = COALESCE(excluded.cost_status, cost_status),
+                    cost_source = COALESCE(excluded.cost_source, cost_source),
++                   cost_coverage = CASE
++                       WHEN cost_coverage IS NULL OR cost_coverage = 'historical' THEN 'historical'
++                       WHEN cost_coverage = 'unknown' OR excluded.cost_coverage = 'unknown' THEN 'unknown'
++                       WHEN cost_coverage = 'actual_only' OR excluded.cost_coverage = 'actual_only' THEN 'unknown'
++                       ELSE 'complete'
++                   END,
++                   summary_included = CASE
++                       WHEN summary_included = excluded.summary_included THEN summary_included
++                       ELSE NULL
++                   END,
+                    last_seen = excluded.last_seen"""
+ 
+ 
+@@ -217,6 +265,10 @@ class SessionUsageMixin:
+             key = None
+             if not kwargs.get("absolute"):
+                 key = (session_id, *(kwargs.get(f) for f in self._TOKEN_DELTA_ROUTE_FIELDS))
++                # Missing and priced reports cannot merge: their sum loses the gap.
++                key += (_cost_coverage(kwargs.get("cost_status"), kwargs.get("estimated_cost_usd"),
++                                       kwargs.get("actual_cost_usd"), kwargs.get("api_call_count", 0)),
++                        kwargs.get("estimated_cost_usd") is None, kwargs.get("actual_cost_usd") is None)
+             if groups and key is not None and groups[-1][0] == key:
+                 merged = groups[-1][2]
+                 for f in self._TOKEN_DELTA_SUM_FIELDS:
+@@ -327,7 +379,9 @@ class SessionUsageMixin:
+         record_model_usage = (not absolute) and has_usage
+ 
+         row = conn.execute(
+-            "SELECT model, billing_provider, api_call_count FROM sessions WHERE id = ?", (session_id,),
++            "SELECT model, billing_provider, api_call_count, cost_coverage, cost_status, "
++            "estimated_cost_usd, actual_cost_usd, input_tokens, output_tokens, cache_read_tokens, "
++            "cache_write_tokens, reasoning_tokens FROM sessions WHERE id = ?", (session_id,),
+         ).fetchone()
+         existing = dict(row) if row is not None else {}
+         # create_session records the requested route before any API call. If that fails
+@@ -344,8 +398,17 @@ class SessionUsageMixin:
+                    billing_base_url = ?, billing_mode = ?
+                    WHERE id = ?""", (model, billing_provider, billing_base_url, billing_mode, session_id))
+         conn.execute(sql, params)
++        if has_accounted_usage:
++            has_history = any(existing.get(k) for k in (*_TOKEN_COUNTERS, "api_call_count")) or any(
++                existing.get(k) is not None for k in ("estimated_cost_usd", "actual_cost_usd", "cost_status"))
++            report = _cost_coverage(cost_status, estimated_cost_usd, actual_cost_usd, api_call_count)
++            # Absolute reports contain cumulative counters but only the latest cost status.
++            if absolute and api_call_count > 1:
++                report = "historical"
++            coverage = _merge_cost_coverage(existing.get("cost_coverage"), report, has_history=has_history)
++            conn.execute("UPDATE sessions SET cost_coverage = ? WHERE id = ?", (coverage, session_id))
+         if record_model_usage:
+-            self._record_model_usage(conn, session_id, task=task, **usage)
++            self._record_model_usage(conn, session_id, task=task, summary_included=True, **usage)
+ 
+     def _record_model_usage(
+         self, conn, session_id: str, *, model: Optional[str]=None, billing_provider: Optional[str]=None,
+@@ -353,6 +416,7 @@ class SessionUsageMixin:
+         output_tokens: int=0, cache_read_tokens: int=0, cache_write_tokens: int=0, reasoning_tokens: int=0,
+         estimated_cost_usd: Optional[float]=None, actual_cost_usd: Optional[float]=None,
+         cost_status: Optional[str]=None, cost_source: Optional[str]=None, api_call_count: int=0, task: str="",
++        summary_included: bool=False,
+     ) -> None:
+         """Accumulate a per-API-call usage delta into session_model_usage, inside the caller's
+         write txn after the ``sessions`` UPDATE. A missing model/provider falls back to
+@@ -363,6 +427,9 @@ class SessionUsageMixin:
+         ``task`` distinguishes what kind of work consumed the tokens: ``''`` (empty) is the main agent loop;
+         auxiliary calls record their task name (``vision``, ``compression``, ``title_generation``, ...) via
+         :meth:`record_auxiliary_usage` (issue #23270).
++        ``summary_included`` identifies the writer, not the task: per-turn voice
++        usage is already in sessions; true auxiliaries are not. A mixed/historical
++        ownership row stays NULL so readers cannot claim to reconcile it.
+         """
+         row = conn.execute(
+             "SELECT model, billing_provider, billing_base_url, billing_mode FROM sessions WHERE id = ?", (session_id,),
+@@ -375,7 +442,10 @@ class SessionUsageMixin:
+             billing_provider or sess.get("billing_provider") or "",
+             billing_base_url or sess.get("billing_base_url") or "",
+             billing_mode or sess.get("billing_mode") or "", task or "", api_call_count or 0, *counts,
+-            float(estimated_cost_usd or 0.0), float(actual_cost_usd or 0.0), cost_status, cost_source, now, now))
++            _ledger_cost(estimated_cost_usd), _ledger_cost(actual_cost_usd), cost_status, cost_source, now, now,
++            _cost_coverage(cost_status if summary_included else "estimated", estimated_cost_usd, actual_cost_usd,
++                           api_call_count),
++            int(summary_included)))
+ 
+     def record_auxiliary_usage(
+         self, session_id: str, task: str, *, model: Optional[str]=None, billing_provider: Optional[str]=None,
+diff --git a/tests/agent/test_missing_usage_accounting.py b/tests/agent/test_missing_usage_accounting.py
+new file mode 100644
+index 0000000000..4bcb42de23
+--- /dev/null
++++ b/tests/agent/test_missing_usage_accounting.py
+@@ -0,0 +1,176 @@
++"""Phase 1 regression: a completed provider call without usage must reach
++state.db as an unknown-cost attempt, not silently vanish from accounting."""
++import logging
++from types import SimpleNamespace
++
++import pytest
++
++from hermes_state import SessionDB
++
++
++@pytest.fixture()
++def db(tmp_path):
++    session_db = SessionDB(db_path=tmp_path / "test_state.db")
++    yield session_db
++    session_db.close()
++
++
++class _Compressor:
++    """Minimal compressor surface record_response_usage touches."""
++
++    awaiting_real_usage_after_compression = False
++    threshold_tokens = 0
++    _context_probed = False
++    _verify_compaction_cleared_threshold = False
++
++    def __init__(self):
++        self.updates = []
++        self.usage_less_notes = 0
++
++    def update_from_response(self, usage):
++        self.updates.append(usage)
++
++    def note_usage_less_response(self):
++        self.usage_less_notes += 1
++
++
++def _agent(db, session_id="s-no-usage"):
++    db.create_session(session_id, source="test", model="m1")
++    return SimpleNamespace(
++        context_compressor=_Compressor(),
++        session_api_calls=0,
++        session_prompt_tokens=0,
++        session_completion_tokens=0,
++        session_total_tokens=0,
++        session_input_tokens=0,
++        session_output_tokens=0,
++        session_cache_read_tokens=0,
++        session_cache_write_tokens=0,
++        session_reasoning_tokens=0,
++        session_estimated_cost_usd=0.0,
++        session_cost_status="unknown",
++        session_cost_source="none",
++        model="m1",
++        provider="p1",
++        base_url="https://p1.example/v1",
++        api_key="k",
++        api_mode="chat_completions",
++        _session_db=db,
++        _session_db_created=True,
++        session_id=session_id,
++        verbose_logging=False,
++        quiet_mode=True,
++        log_prefix="",
++    )
++
++
++def _totals(db, session_id):
++    with db._lock:
++        row = db._conn.execute(
++            "SELECT input_tokens, output_tokens, api_call_count, estimated_cost_usd,"
++            " cost_status, cost_coverage FROM sessions WHERE id = ?",
++            (session_id,),
++        ).fetchone()
++    return dict(row) if row is not None else None
++
++
++def test_missing_usage_persists_unknown_call_and_keeps_summary_clean(db, tmp_path, monkeypatch, caplog):
++    """The producer queues a zero-token unknown-cost delta; summary totals stay
++    zero, coverage is unknown, and a later priced call cannot turn the pair
++    into a complete covered total."""
++    from agent import turn_usage
++
++    agent = _agent(db)
++    response = SimpleNamespace(usage=None)
++
++    with caplog.at_level(logging.INFO, logger="agent.turn_usage"):
++        turn_usage.record_response_usage(
++            agent, response, messages=[], api_call_count=1, api_duration=0.2,
++            compression_attempts=0, max_compression_attempts=3)
++
++    assert agent.session_api_calls == 1
++    assert db.flush_token_counts()
++
++    totals = _totals(db, "s-no-usage")
++    assert totals["api_call_count"] == 1
++    assert totals["input_tokens"] == 0 and totals["output_tokens"] == 0
++    assert totals["estimated_cost_usd"] in (0.0, None)
++    assert totals["cost_coverage"] == "unknown"
++
++    # A later priced call on the same route cannot make the pair complete.
++    db.update_token_counts(
++        "s-no-usage", input_tokens=10, output_tokens=2, estimated_cost_usd=0.2,
++        cost_status="estimated", cost_source="provider_models_api",
++        billing_provider="p1", billing_base_url="https://p1.example/v1",
++        model="m1", api_call_count=1)
++
++    totals = _totals(db, "s-no-usage")
++    assert totals["api_call_count"] == 2
++    assert totals["cost_coverage"] == "unknown"
++    with db._lock:
++        route = dict(db._conn.execute(
++            "SELECT api_call_count, cost_coverage, summary_included FROM session_model_usage"
++            " WHERE session_id = 's-no-usage'").fetchone())
++    assert route["api_call_count"] == 2
++    assert route["cost_coverage"] == "unknown"
++    assert route["summary_included"] == 1  # a real main-loop delta, even when unpriced
++
++
++def test_missing_usage_reopen_survives_persistence(tmp_path, monkeypatch):
++    """The unknown attempt survives a close/reopen of the store."""
++    from agent import turn_usage
++
++    db = SessionDB(db_path=tmp_path / "reopen.db")
++    try:
++        agent = _agent(db, "s-reopen")
++        turn_usage.record_response_usage(
++            agent, SimpleNamespace(usage=None), messages=[], api_call_count=1,
++            api_duration=0.1, compression_attempts=0, max_compression_attempts=3)
++        assert db.flush_token_counts()
++    finally:
++        db.close()
++
++    reopened = SessionDB(db_path=tmp_path / "reopen.db")
++    try:
++        totals = _totals(reopened, "s-reopen")
++        assert totals["api_call_count"] == 1
++        assert totals["cost_coverage"] == "unknown"
++    finally:
++        reopened.close()
++
++
++def test_included_zero_usage_is_not_reported_unknown(monkeypatch):
++    """A genuinely included/free response (real usage, zero dollars) must not
++    be misfiled as missing usage."""
++    from agent import turn_usage
++
++    compressor = _Compressor()
++    queue = []
++
++    agent = SimpleNamespace(
++        context_compressor=compressor,
++        session_api_calls=0,
++        session_prompt_tokens=0, session_completion_tokens=0, session_total_tokens=0,
++        session_input_tokens=0, session_output_tokens=0, session_cache_read_tokens=0,
++        session_cache_write_tokens=0, session_reasoning_tokens=0,
++        session_estimated_cost_usd=0.0, session_cost_status="unknown", session_cost_source="none",
++        model="m-free", provider="p1", base_url="", api_key="k", api_mode="chat_completions",
++        _session_db=SimpleNamespace(queue_token_counts=lambda *a, **k: queue.append(k)),
++        _session_db_created=True, session_id="s-free",
++        verbose_logging=False, quiet_mode=True, log_prefix="",
++    )
++    from agent import usage_pricing as pricing
++    from unittest.mock import patch
++
++    usage = {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
++    with patch("agent.turn_usage.estimate_usage_cost",
++               return_value=pricing.CostResult(amount_usd=pricing._ZERO, status="included",
++                                               source="none", label="included")):
++        turn_usage.record_response_usage(
++            agent, SimpleNamespace(usage=usage), messages=[], api_call_count=1,
++            api_duration=0.1, compression_attempts=0, max_compression_attempts=3)
++
++    assert agent.session_api_calls == 1
++    assert agent.session_cost_status == "included"
++    assert queue and queue[-1]["cost_status"] == "included"
++    assert queue[-1]["input_tokens"] == 5  # real usage persisted, not an unknown attempt
+\ No newline at end of file
+diff --git a/tests/agent/test_platform_hint_cli_code.py b/tests/agent/test_platform_hint_cli_code.py
+new file mode 100644
+index 0000000000..229f806540
+--- /dev/null
++++ b/tests/agent/test_platform_hint_cli_code.py
+@@ -0,0 +1,58 @@
++"""CLI platform instructions reflect the current profile's code renderer."""
++from types import SimpleNamespace
++from unittest.mock import patch
++import unittest
++
++from agent.prompt_builder import PLATFORM_HINTS
++from agent.system_prompt import platform_hint
++
++
++class CLIPlatformHintTests(unittest.TestCase):
++    def hint(self, config, platform="cli", overrides=None):
++        agent = SimpleNamespace(platform=platform, _platform_hint_overrides=overrides or {})
++        with patch("agent.prompt_builder._config_readonly", return_value=config):
++            return platform_hint(agent)
++
++    def test_enabled_renderer_allows_language_fences_and_keeps_delivery_limits(self):
++        hint = self.hint({"display": {"code_highlighting": True}})
++        self.assertIn("For code snippets, use fenced code blocks with a language tag", hint)
++        self.assertIn("Write prose as plain text.", hint)
++        self.assertIn("MEDIA:/path tags are NOT intercepted", hint)
++        self.assertIn("Cron jobs scheduled from this session are LOCAL-ONLY", hint)
++        self.assertNotIn("Markdown does NOT render", hint)
++
++    def test_missing_disabled_and_malformed_settings_keep_original_hint(self):
++        for config in ({}, {"display": {}}, {"display": {"code_highlighting": False}},
++                       {"display": {"code_highlighting": "true"}}, {"display": None}, None):
++            with self.subTest(config=config):
++                self.assertEqual(self.hint(config), PLATFORM_HINTS["cli"])
++
++    def test_config_read_failure_keeps_plain_terminal_instructions(self):
++        agent = SimpleNamespace(platform="cli", _platform_hint_overrides={})
++        with patch("hermes_cli.config.load_config_readonly", side_effect=OSError("unreadable")):
++            self.assertEqual(platform_hint(agent), PLATFORM_HINTS["cli"])
++
++    def test_other_surfaces_do_not_inherit_cli_code_instructions(self):
++        surfaces = sorted(k for k in PLATFORM_HINTS if k != "cli")
++        for surface in surfaces:
++            with self.subTest(surface=surface), patch.dict("os.environ", {"HERMES_DESKTOP_TERMINAL": "0"}):
++                self.assertEqual(self.hint({"display": {"code_highlighting": True}}, surface),
++                                 PLATFORM_HINTS[surface])
++
++    def test_explicit_profile_override_still_has_precedence(self):
++        config = {"display": {"code_highlighting": True}}
++        self.assertEqual(self.hint(config, overrides={"cli": {"replace": "Custom terminal contract."}}),
++                         "Custom terminal contract.")
++        appended = self.hint(config, overrides={"cli": {"append": "Prefer bash examples."}})
++        self.assertIn("use fenced code blocks with a language tag", appended)
++        self.assertTrue(appended.endswith("\n\nPrefer bash examples."))
++
++    def test_each_profile_read_changes_capability_without_global_mutation(self):
++        enabled = self.hint({"display": {"code_highlighting": True}})
++        disabled = self.hint({"display": {"code_highlighting": False}})
++        self.assertIn("syntax colors", enabled)
++        self.assertEqual(disabled, PLATFORM_HINTS["cli"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/agent/test_usage_pricing_tiers.py b/tests/agent/test_usage_pricing_tiers.py
+new file mode 100644
+index 0000000000..d9ab6bfd40
+--- /dev/null
++++ b/tests/agent/test_usage_pricing_tiers.py
+@@ -0,0 +1,157 @@
++"""OpenRouter context-pricing overrides: tiers must reprice the whole request."""
++from decimal import Decimal
++from types import SimpleNamespace
++
++import pytest
++
++from agent.usage_pricing import (
++    CanonicalUsage,
++    estimate_usage_cost,
++    get_pricing_entry,
++    _pricing_entry_from_metadata,
++)
++
++# Cached OpenRouter /models shape for gpt-6.1-sol: base rates plus one
++# context tier starting at min_prompt_tokens=272000 (per-token USD).
++_SOL_PRICING = {
++    "prompt": "0.000002",
++    "completion": "0.00001",
++    "input_cache_read": "0.0000001",
++    "input_cache_write": "0.0000025",
++    "overrides": [
++        {"min_prompt_tokens": 272000, "prompt": "0.000004", "completion": "0.000015",
++         "input_cache_read": "0.0000002", "input_cache_write": "0.000005"},
++    ],
++}
++
++
++@pytest.fixture
++def openrouter_metadata(monkeypatch):
++    from agent import model_metadata
++    monkeypatch.setattr(model_metadata, "fetch_model_metadata", lambda force_refresh=False: {
++        "openai/gpt-6.1-sol": {"pricing": dict(_SOL_PRICING)},
++    })
++
++
++def _sol(uncached, cached=0, writes=0, output=1000):
++    return estimate_usage_cost(
++        "openai/gpt-6.1-sol",
++        CanonicalUsage(input_tokens=uncached, output_tokens=output,
++                       cache_read_tokens=cached, cache_write_tokens=writes),
++        provider="openrouter")
++
++
++def test_above_threshold_whole_request_uses_override_rates(openrouter_metadata):
++    """prompt_tokens 301,000 >= 272,000: every component reprices, including cache."""
++    result = _sol(uncached=300_000, cached=0, writes=0, output=1_000)
++    assert result.amount_usd == (Decimal(300_000) * Decimal("0.000004")
++                                 + Decimal(1_000) * Decimal("0.000015"))
++
++
++def test_below_threshold_uses_base_rates(openrouter_metadata):
++    result = _sol(uncached=271_000, output=1_000)
++    assert result.amount_usd == (Decimal(271_000) * Decimal("0.000002")
++                                 + Decimal(1_000) * Decimal("0.00001"))
++
++
++def test_cache_components_reprice_in_tier(openrouter_metadata):
++    """Crossing the tier via cached tokens also reprices cache reads/writes."""
++    result = _sol(uncached=1000, cached=271_000, writes=500)
++    assert result.amount_usd == (Decimal(1_000) * Decimal("0.000004")
++                                 + Decimal(271_000) * Decimal("0.0000002")
++                                 + Decimal(500) * Decimal("0.000005")
++                                 + Decimal(1_000) * Decimal("0.000015"))
++
++
++def test_tier_threshold_is_inclusive_at_boundary(openrouter_metadata):
++    # prompt_tokens = uncached + cached, output excluded. Exactly 272,000
++    # crosses the tier (inclusive threshold).
++    at = _sol(uncached=271_000, cached=1_000, output=1_000)
++    assert at.amount_usd == (Decimal(271_000) * Decimal("0.000004")
++                             + Decimal(1_000) * Decimal("0.0000002")
++                             + Decimal(1_000) * Decimal("0.000015"))
++    # 271,999 prompt tokens stays on base rates.
++    just_under = _sol(uncached=271_999, output=1_000)
++    assert just_under.amount_usd == (Decimal(271_999) * Decimal("0.000002")
++                                     + Decimal(1_000) * Decimal("0.00001"))
++
++
++def test_highest_applicable_tier_wins():
++    entry = _pricing_entry_from_metadata(
++        {"m": {"pricing": {**_SOL_PRICING, "overrides": [
++            {"min_prompt_tokens": 100_000, "prompt": "0.000003"},
++            {"min_prompt_tokens": 272_000, "prompt": "0.000004"},
++        ]}}}, "m", source_url="u", pricing_version="v")
++    assert entry is not None
++    # The metadata parser keeps the LOWEST threshold as the entry's tier anchor
++    # so every override tier is reachable; per-request selection in
++    # estimate_usage_cost picks the highest applicable override.
++    assert entry.tier_threshold_tokens == 100_000
++    assert entry.input_cost_per_million == Decimal("2")
++
++
++def test_tier_selection_uses_highest_matching_override(monkeypatch):
++    from agent import model_metadata
++    metadata = {"m": {"pricing": {**_SOL_PRICING, "overrides": [
++        {"min_prompt_tokens": 100_000, "prompt": "0.000003", "completion": "0.000012"},
++        {"min_prompt_tokens": 272_000, "prompt": "0.000004", "completion": "0.000015"},
++    ]}}}
++    monkeypatch.setattr(model_metadata, "fetch_model_metadata", lambda force_refresh=False: metadata)
++    result = estimate_usage_cost(
++        "m", CanonicalUsage(input_tokens=300_000, output_tokens=1_000), provider="openrouter")
++    assert result.amount_usd == (Decimal(300_000) * Decimal("0.000004")
++                                 + Decimal(1_000) * Decimal("0.000015"))
++
++
++def test_partial_override_falls_back_to_base_for_missing_fields(monkeypatch):
++    from agent import model_metadata
++    metadata = {"m": {"pricing": {"prompt": "0.000002", "completion": "0.00001",
++                                  "input_cache_read": "0.0000001",
++                                  "overrides": [{"min_prompt_tokens": 200_000, "prompt": "0.000004"}]}}}
++    monkeypatch.setattr(model_metadata, "fetch_model_metadata", lambda force_refresh=False: metadata)
++    # Input reprices; completion keeps the base rate; missing cache-read fields
++    # with zero cache usage must not turn the request unknown.
++    result = estimate_usage_cost(
++        "m", CanonicalUsage(input_tokens=250_000, output_tokens=10), provider="openrouter")
++    assert result.amount_usd == (Decimal(250_000) * Decimal("0.000004")
++                                 + Decimal(10) * Decimal("0.00001"))
++
++
++def test_missing_cache_rate_with_nonzero_cache_use_stays_unknown(monkeypatch):
++    from agent import model_metadata
++    metadata = {"m": {"pricing": {"prompt": "0.000002", "completion": "0.00001",
++                                  "overrides": [{"min_prompt_tokens": 200_000, "prompt": "0.000004"}]}}}
++    monkeypatch.setattr(model_metadata, "fetch_model_metadata", lambda force_refresh=False: metadata)
++    result = estimate_usage_cost(
++        "m", CanonicalUsage(input_tokens=250_000, output_tokens=10, cache_read_tokens=50_000),
++        provider="openrouter")
++    assert result.status == "unknown" and result.amount_usd is None
++
++
++@pytest.mark.parametrize("raw", [
++    {"overrides": [{"min_prompt_tokens": 0, "prompt": "0.000004"}]},           # zero threshold
++    {"overrides": [{"min_prompt_tokens": -5, "prompt": "0.000004"}]},          # negative
++    {"overrides": [{"min_prompt_tokens": "abc", "prompt": "0.000004"}]},       # non-numeric
++    {"overrides": [{"min_prompt_tokens": True, "prompt": "0.000004"}]},        # JSON bool is an int
++    {"overrides": [{"min_prompt_tokens": 100}]},                               # missing rates
++    {"overrides": [{"prompt": "0.000004"}]},                                   # missing threshold
++    {"overrides": "garbage"},                                                  # wrong shape
++])
++def test_malformed_overrides_are_ignored_not_fatal(raw, monkeypatch):
++    from agent import model_metadata
++    metadata = {"m": {"pricing": {"prompt": "0.000002", "completion": "0.00001", **raw}}}
++    monkeypatch.setattr(model_metadata, "fetch_model_metadata", lambda force_refresh=False: metadata)
++    entry = get_pricing_entry("m", provider="openrouter")
++    assert entry is not None
++    assert entry.input_cost_per_million == Decimal("2")
++    assert entry.tier_threshold_tokens is None
++    result = estimate_usage_cost(
++        "m", CanonicalUsage(input_tokens=500_000, output_tokens=0), provider="openrouter")
++    assert result.amount_usd == Decimal("1")  # base rate on the whole 0.5M input
++
++
++def test_base_direct_provider_entry_unaffected_by_openrouter_tiers(openrouter_metadata):
++    """Non-OpenRouter routes keep their own pricing; tiers never leak across routes."""
++    from agent.usage_pricing import resolve_billing_route
++    route = resolve_billing_route("openai/gpt-6.1-sol", provider="openrouter")
++    assert route.provider == "openrouter"
+\ No newline at end of file
+diff --git a/tests/hermes_cli/test_cli_code_blocks.py b/tests/hermes_cli/test_cli_code_blocks.py
+new file mode 100644
+index 0000000000..4ca8251e40
+--- /dev/null
++++ b/tests/hermes_cli/test_cli_code_blocks.py
+@@ -0,0 +1,500 @@
++"""Behavior tests runnable without pytest: python -m unittest discover ..."""
++from io import StringIO
++import re
++import unittest
++from unittest.mock import patch
++
++import cli
++from rich.console import Console
++from rich.panel import Panel
++from rich.text import Text
++from hermes_cli.cli_code_blocks import CodeBlock, code_block_ansi, render_code_block, split_fenced_code
++
++
++def plain_ansi(value):
++    return re.sub(r"\x1b\[[0-9;]*m", "", value)
++
++
++class CodeBlockTests(unittest.TestCase):
++    def setUp(self):
++        self.config = patch.dict(cli.CLI_CONFIG, {"display": {"code_highlighting": True}})
++        self.config.start()
++        self.addCleanup(self.config.stop)
++
++    def stream(self, text, chunk_size=1, finish=True, enabled=True):
++        obj = cli.HermesCLI.__new__(cli.HermesCLI)
++        obj.code_highlighting = enabled
++        obj.final_response_markdown = "strip"
++        obj.show_reasoning = False
++        obj.show_timestamps = False
++        obj._reset_stream_state()
++        obj._scrollback_box_width = lambda: 40
++        output = []
++        with patch.object(cli, "_cprint", lambda value: output.append(str(value))):
++            for start in range(0, len(text), chunk_size):
++                obj._stream_delta(text[start:start + chunk_size])
++            if finish:
++                obj._flush_stream()
++        return obj, "\n".join(output), output
++
++    def final(self, text, mode="strip", width=80):
++        renderable = cli._render_final_assistant_content(text, mode)
++        buf = StringIO()
++        Console(file=buf, force_terminal=True, color_system="truecolor", width=width).print(renderable)
++        return buf.getvalue()
++
++    def test_stream_and_final_preserve_source_and_colors(self):
++        source = 'def hello():\n    print("**raw**", "[x](url)")\n'
++        response = "# Heading\n```python\n" + source + "```\n**Done**"
++        for output in (self.stream(response)[1], self.final(response)):
++            plain = Text.from_ansi(output).plain
++            self.assertIn("Heading\npython\n" + source + "Done", plain)
++            self.assertNotIn("```", plain)
++            self.assertNotIn("# Heading", plain)
++            self.assertIn("48;2;32;36;44", output)
++            self.assertIn("38;2;", output)
++        code_ansi = code_block_ansi(CodeBlock(source, "python"))
++        self.assertIn("38;2;102;217;239", code_ansi)  # monokai keyword
++        self.assertEqual(plain_ansi(code_ansi), "python\n" + source)
++
++    def test_code_not_table_or_markdown(self):
++        source = "# comment\n| a | b |\n| --- | --- |\n**bold** _value_ `x`\n"
++        for output in (self.stream("~~~text\n" + source + "~~~")[1],
++                       self.final("~~~text\n" + source + "~~~")):
++            self.assertIn("text\n" + source, Text.from_ansi(output).plain)
++
++    def test_literal_think_tags_survive_all_chunk_sizes(self):
++        text = "<think>hidden</think>\n```xml\n<think>literal</think>\n<tool_call>x</tool_call>\n```\nVisible"
++        for chunk in (1, 2, 7, len(text)):
++            output = Text.from_ansi(self.stream(text, chunk)[1]).plain
++            self.assertIn("xml\n<think>literal</think>\n<tool_call>x</tool_call>\nVisible", output)
++            self.assertNotIn("hidden", output)
++
++    def test_final_scrubbing_preserves_fenced_tags_and_raw_history(self):
++        source = "<think>hidden</think>\n```xml\n<think>literal</think>\n```"
++        cleaned = cli._assistant_copy_text(source)
++        self.assertEqual(cleaned, "```xml\n<think>literal</think>\n```")
++        self.assertIn("xml\n<think>literal</think>", Text.from_ansi(self.final(cleaned)).plain)
++        self.assertEqual(source, "<think>hidden</think>\n```xml\n<think>literal</think>\n```")
++
++    def test_unknown_and_unlabelled(self):
++        for language, label in (("not-a-real-language", "not-a-real-language"), ("", "text")):
++            text = "```" + language + "\n  raw **x**\n```"
++            for output in (self.stream(text)[1], self.final(text)):
++                self.assertIn(label + "\n  raw **x**\n", Text.from_ansi(output).plain)
++                self.assertIn("48;2;32;36;44", output)
++
++    def test_fence_lengths_and_characters(self):
++        cases = (("````python", "```\n~~~\n", "`````"),
++                 ("~~~~text", "~~~\n```\n", "~~~~"))
++        for opening, source, closing in cases:
++            response = opening + "\n" + source + closing + "\nDone"
++            for output in (self.stream(response)[1], self.final(response)):
++                self.assertIn(source + "Done", Text.from_ansi(output).plain)
++
++    def test_inline_fences_and_invalid_openers_are_prose(self):
++        text = "mention ```python here\n    ```python\n```bad`info\n"
++        self.assertEqual(list(split_fenced_code(text)), [text])
++
++    def test_incomplete_and_partial_close(self):
++        for text, expected in (("```python\n    print(1)", "python\n    print(1)\n"),
++                               ("```xml\n<think", "xml\n<think\n"),
++                               ("```text\nraw\n``", "text\nraw\n``\n"),
++                               ("```python", "python\n")):
++            for output in (self.stream(text)[1], self.final(text)):
++                self.assertIn(expected, Text.from_ansi(output).plain)
++
++    def test_boundary_flush_and_reset(self):
++        obj, _, output = self.stream("```python\n    print(1)", finish=False)
++        with patch.object(cli, "_cprint", lambda value: output.append(str(value))):
++            obj._stream_delta(None)
++            obj._stream_delta("**Next**\n")
++            obj._flush_stream()
++        plain = Text.from_ansi("\n".join(output)).plain
++        self.assertIn("python\n    print(1)\n", plain)
++        self.assertIn("Next\n", plain)
++        self.assertEqual(plain.count("python"), 1)
++        self.assertNotIn("**Next**", plain)
++
++    def test_block_is_buffered_until_close_not_duplicated(self):
++        obj, _, output = self.stream("```python\ndef hello():\n", finish=False)
++        self.assertNotIn("def hello", Text.from_ansi("\n".join(output)).plain)
++        with patch.object(cli, "_cprint", lambda value: output.append(str(value))):
++            obj._stream_delta("    return 1\n```\n")
++            obj._flush_stream()
++            obj._flush_stream()
++        plain = Text.from_ansi("\n".join(output)).plain
++        self.assertEqual(plain.count("def hello():"), 1)
++        self.assertIn("    return 1", plain)
++
++    def test_narrow_stream_does_not_truncate_or_insert_newlines(self):
++        source = "    print('" + "x" * 100 + "')\n"
++        with patch.object(cli, "_terminal_columns", lambda: 8):
++            output = self.stream("```python\n" + source + "```")[1]
++        self.assertIn("python\n" + source, Text.from_ansi(output).plain)
++        # Rich final rendering in a narrow panel must retain every character too.
++        buf = StringIO()
++        Console(file=buf, width=12, color_system=None).print(
++            Panel(cli._render_final_assistant_content("```text\n" + source + "```", "strip")))
++        self.assertEqual(buf.getvalue().count("x"), 101)  # includes the text language label
++
++    def test_multiline_lexer_state(self):
++        source = 'value = """first\nsecond\n"""\n'
++        ansi = code_block_ansi(CodeBlock(source, "python"))
++        self.assertEqual(plain_ansi(ansi), "python\n" + source)
++        second = ansi.splitlines()[2]
++        self.assertIn("38;2;230;219;116", second)  # multiline string color
++
++    def test_empty_blocks(self):
++        for output in (self.stream("~~~\n~~~\n")[1], self.final("~~~\n~~~\n")):
++            self.assertIn("text\n", Text.from_ansi(output).plain)
++
++    def test_raw_and_render_modes_share_code_renderer(self):
++        for mode in ("raw", "render"):
++            plain = Text.from_ansi(self.final("```python\n  print(1)\n```", mode)).plain
++            self.assertIn("python", plain)
++            self.assertIn("  print(1)", plain)
++            self.assertNotIn("```", plain)
++
++    def test_disabled_default_keeps_old_output(self):
++        with patch.dict(cli.CLI_CONFIG, {"display": {}}):
++            self.assertEqual(cli._render_final_assistant_content("**x**\n```python\n1\n```", "strip").plain,
++                             "x\npython\n1")
++        output = Text.from_ansi(self.stream("**x**\n```python\n1\n```", enabled=False)[1]).plain
++        self.assertIn("x\npython\n1", output)
++
++    def test_real_init_reads_boolean_option(self):
++        obj = cli.HermesCLI.__new__(cli.HermesCLI)
++        for display, enabled in (({}, False), ({"code_highlighting": True}, True),
++                                 ({"code_highlighting": False}, False), ({"code_highlighting": "false"}, False)):
++            with patch.dict(cli.CLI_CONFIG, {"display": display}):
++                obj._init_display_options(None, None)
++            self.assertEqual(obj.code_highlighting, enabled)
++
++    def test_actual_restored_history_uses_shared_renderer_and_preserves_storage(self):
++        obj = cli.HermesCLI.__new__(cli.HermesCLI)
++        obj.code_highlighting = True
++        obj.final_response_markdown = "strip"
++        obj.resume_display = "full"
++        source = "# Restored\n```python\n    print('**raw**')\n```"
++        obj.conversation_history = [{"role": "user", "content": "show code"},
++                                    {"role": "assistant", "content": source}]
++        buf = StringIO()
++        console = Console(file=buf, width=80, force_terminal=True, color_system="truecolor")
++        obj._console_print = console.print
++        obj._display_resumed_history()
++        output = buf.getvalue()
++        plain = Text.from_ansi(output).plain
++        self.assertIn("Restored", plain)
++        self.assertIn("    print('**raw**')", plain)
++        self.assertNotIn("```", plain)
++        self.assertNotIn("# Restored", plain)
++        self.assertIn("48;2;32;36;44", output)
++        self.assertEqual(obj.conversation_history[1]["content"], source)
++
++    def test_prose_with_no_fences_is_unchanged(self):
++        source = "# Heading\n\n**bold** and `literal`\n- item\n  - nested\n"
++        for source in (source, "    unfenced(1)  \n"):
++            for mode in ("strip", "raw", "render"):
++                enabled = self.final(source, mode)
++                with patch.dict(cli.CLI_CONFIG, {"display": {}}):
++                    disabled = self.final(source, mode)
++                self.assertEqual(plain_ansi(enabled), plain_ansi(disabled))
++
++    def test_table_adjacent_to_code_does_not_capture_code(self):
++        source = "| x | y |\n| --- | --- |\n| 1 | 2 |\n```text\n| raw | table |\n```\nDone"
++        output = plain_ansi(self.stream(source)[1])
++        self.assertIn("text\n| raw | table |\nDone", output)
++        self.assertLess(output.index("| 1"), output.index("text\n"))
++
++    def test_partial_literal_tag_at_end_of_prose_is_not_lost(self):
++        output = plain_ansi(self.stream("literal <thi")[1])
++        self.assertIn("literal <thi", output)
++
++    def test_existing_markdown_regressions(self):
++        import importlib.util
++        from pathlib import Path
++        spec = importlib.util.spec_from_file_location(
++            "markdown_regressions", Path(__file__).with_name("test_cli_markdown_rendering.py"))
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        with patch.dict(cli.CLI_CONFIG, {"display": {}}):
++            for name, test in vars(module).items():
++                if name.startswith("test_"):
++                    with self.subTest(name=name):
++                        test()
++
++    def resumed(self, source, mode="strip"):
++        obj = cli.HermesCLI.__new__(cli.HermesCLI)
++        obj.code_highlighting = True
++        obj.final_response_markdown = mode
++        obj.resume_display = "full"
++        obj.conversation_history = [{"role": "assistant", "content": source}]
++        buf = StringIO()
++        obj._console_print = Console(file=buf, width=100, force_terminal=True,
++                                     color_system="truecolor").print
++        obj._display_resumed_history()
++        self.assertEqual(obj.conversation_history[0]["content"], source)
++        return buf.getvalue()
++
++    def test_reasoning_fences_hidden_in_stream_final_copy_and_resume(self):
++        for fence in ("```", "~~~"):
++            for ending in ("private tail</think>\nVisible", "private tail"):
++                source = "<think>\n" + fence + "python\nSECRET = 123\n" + fence + "\n" + ending
++                expected = "Visible" if "</think>" in ending else ""
++                self.assertEqual(cli._assistant_copy_text(source), expected)
++                outputs = [self.final(source, mode) for mode in ("strip", "raw", "render")]
++                outputs.append(self.resumed(source))
++                outputs.extend(self.stream(source, chunk)[1] for chunk in (1, 2, 7, len(source)))
++                for output in outputs:
++                    with self.subTest(fence=fence, ending=ending, output=repr(output)):
++                        plain = plain_ansi(output)
++                        self.assertNotIn("SECRET", plain)
++                        self.assertNotIn("private tail", plain)
++                        if expected:
++                            self.assertIn(expected, plain)
++
++    def test_reasoning_close_immediately_before_fence(self):
++        source = "<think>hidden\n</think>```xml\n<think>literal</think>\n```\nDone"
++        self.assertEqual(cli._assistant_copy_text(source),
++                         "```xml\n<think>literal</think>\n```\nDone")
++        outputs = [self.final(source, mode) for mode in ("strip", "raw", "render")]
++        outputs.extend(self.stream(source, chunk)[1] for chunk in (1, 2, 7, len(source)))
++        outputs.append(self.resumed(source))
++        for output in outputs:
++            self.assertIn("<think>literal</think>", plain_ansi(output))
++            self.assertIn("Done", plain_ansi(output))
++            self.assertNotIn("hidden", plain_ansi(output))
++
++    def test_nested_reasoning_stays_hidden_in_final_copy_and_resume(self):
++        sources = (
++            "<think>outer\n<reasoning>inner</reasoning>SECRET</think>\nDone",
++            "<think>outer<think>inner</think>SECRET</think>\nDone",
++            "<THINK>outer<Reasoning>inner</rEaSoNiNg>SECRET</think>\nDone",
++            "<think>outer</reasoning>SECRET</think>\nDone",
++            "<think>outer<reasoning>inner</think>SECRET</reasoning></think>\nDone",
++        )
++        for source in sources:
++            with self.subTest(source=source):
++                self.assertEqual(cli._assistant_copy_text(source), "Done")
++                for mode in ("strip", "raw", "render"):
++                    for output in (self.final(source, mode), self.resumed(source, mode)):
++                        plain = plain_ansi(output)
++                        self.assertNotIn("SECRET", plain)
++                        self.assertNotIn("outer", plain)
++                        self.assertNotIn("inner", plain)
++                        self.assertIn("Done", plain)
++        for source in ("<think>outer<reasoning>inner</reasoning>SECRET",
++                       "<think>outer</reasoning>SECRET"):
++            self.assertEqual(cli._assistant_copy_text(source), "")
++            self.assertNotIn("SECRET", plain_ansi(self.final(source)))
++            self.assertNotIn("SECRET", plain_ansi(self.resumed(source)))
++
++    def test_literal_reasoning_tag_in_visible_fence_info(self):
++        for fence in ("```", "~~~"):
++            for prefix in ("", "<think>hidden\n</think>"):
++                source = prefix + fence + "xml <think>\n<think>literal</think>\n" + fence + "\nDone"
++                expected = fence + "xml <think>\n<think>literal</think>\n" + fence + "\nDone"
++                self.assertEqual(cli._assistant_copy_text(source), expected)
++                outputs = [self.final(source, mode) for mode in ("strip", "raw", "render")]
++                outputs.append(self.resumed(source))
++                outputs.extend(self.stream(source, chunk)[1] for chunk in (1, 2, 7, len(source)))
++                for output in outputs:
++                    plain = plain_ansi(output)
++                    self.assertIn("xml", plain)
++                    self.assertIn("<think>literal</think>", plain)
++                    self.assertIn("Done", plain)
++                    self.assertNotIn("hidden", plain)
++
++    def test_incomplete_fence_copy_and_final_preserve_trailing_whitespace(self):
++        for ending in ("\t", "  ", "\t  \n\n"):
++            recipe = "all:\n\t@echo hello" + ending
++            source = "```makefile\n" + recipe
++            self.assertEqual(cli._assistant_copy_text(source), source)
++            obj = cli.HermesCLI.__new__(cli.HermesCLI)
++            obj.conversation_history = [{"role": "assistant", "content": source}]
++            with patch("hermes_cli.clipboard.is_remote_shell_session", return_value=False), \
++                 patch("hermes_cli.clipboard.write_clipboard_text", return_value=True) as copy, \
++                 patch.object(cli, "_cprint"):
++                obj._handle_copy_command("/copy")
++            copy.assert_called_once_with(source)
++            for mode in ("strip", "raw", "render"):
++                with patch("hermes_cli.cli_code_blocks.render_code_block", wraps=render_code_block) as render:
++                    cli._render_final_assistant_content(cli._assistant_copy_text(source), mode)
++                self.assertEqual(render.call_args.args[0], CodeBlock(recipe, "makefile"))
++            self.assertEqual(obj.conversation_history[0]["content"], source)
++        self.assertEqual(cli._assistant_copy_text("  ordinary prose  \n\n"), "ordinary prose")
++
++    def test_terminal_controls_cannot_execute_in_code_display(self):
++        payload = ("BEFORE\x1b[2JAFTER\x1b]52;c;evil\x07\x1bPdata\x1b\\"
++                   "\x9b2J\x9dtitle\x9c\x00\x07\x08\x1b\n")
++        source = "```text\n" + payload + "```\nDone"
++        # Capture bytes. Never write an executable payload to a real terminal.
++        outputs = [code_block_ansi(CodeBlock(payload, "text"))]
++        outputs.extend(self.final(source, mode) for mode in ("strip", "raw", "render"))
++        outputs.append(self.resumed(source))
++        outputs.append(self.stream(source)[1])
++        for output in outputs:
++            plain = plain_ansi(output)
++            self.assertNotRegex(plain, r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
++            self.assertIn("BEFOREAFTER", plain)
++        self.assertEqual(cli._assistant_copy_text(source), source)
++
++    def test_partial_prose_preview_without_newline_or_duplicate_output(self):
++        sentence = "A long unfinished sentence " * 8
++        for enabled in (True, False):
++            for chunk in (1, 7, len(sentence)):
++                obj, _, output = self.stream(sentence, chunk, finish=False, enabled=enabled)
++                self.assertTrue(getattr(obj, "_spinner_text", "").startswith("… "))
++                self.assertEqual(obj._stream_buf, sentence)
++                self.assertNotIn(sentence, plain_ansi("\n".join(output)))
++                with patch.object(cli, "_cprint", lambda value: output.append(str(value))):
++                    obj._stream_delta("\n```xml\n<think>literal</think>\n```\n")
++                    obj._flush_stream()
++                plain = plain_ansi("\n".join(output))
++                self.assertEqual(plain.count(sentence.rstrip()), 1)
++                if enabled:
++                    self.assertIn("<think>literal</think>", plain)
++
++    def test_partial_fence_and_code_never_become_prose_preview(self):
++        for prefix in ("```", "  ~~~", "```python\n"):
++            obj, _, _ = self.stream(prefix + "x" * 100, finish=False)
++            self.assertFalse(getattr(obj, "_spinner_text", ""))
++        # Four spaces and inline delimiters cannot start a fence.
++        for prose in ("    ```", "plain ```"):
++            obj, _, _ = self.stream(prose + "x" * 100, finish=False)
++            self.assertTrue(getattr(obj, "_spinner_text", ""))
++
++    def test_unmocked_stream_printer_in_disposable_pty(self):
++        import os
++        import select
++        import subprocess
++        import sys
++        import time
++        if os.name != "posix":
++            self.skipTest("POSIX PTY required")
++        import pty
++
++        source = ("<think>\n```python\nSECRET = 123\n```\nprivate tail</think>"
++                  "```makefile\nall:\n\t@echo hello\n```\nDone")
++        from pathlib import Path
++        repository = str(Path(__file__).resolve().parents[2])
++        script = (f"import sys, types; sys.path.insert(0, {repository!r})\n"
++                  "sys.modules['hermes_bootstrap'] = types.ModuleType('hermes_bootstrap')\n"
++                  "import cli\n"
++                  "cli.CLI_CONFIG.setdefault('display', {})['code_highlighting'] = True\n"
++                  "obj = cli.HermesCLI.__new__(cli.HermesCLI)\n"
++                  "obj.code_highlighting = True\n"
++                  "obj.final_response_markdown = 'strip'\n"
++                  "obj.show_reasoning = False\n"
++                  "obj.show_timestamps = False\n"
++                  "obj._reset_stream_state()\n"
++                  "obj._scrollback_box_width = lambda: 40\n"
++                  f"obj._stream_delta({source!r})\n"
++                  "obj._flush_stream()\n")
++        # A managed base interpreter loads dependencies from a selected venv.
++        # Use that venv directly and stub bootstrap above so the isolated child
++        # cannot trigger dependency installation against pytest's scratch profile.
++        executable = sys.executable
++        if sys.prefix == sys.base_prefix:
++            from pathlib import Path
++            import rich
++            for parent in Path(rich.__file__).parents:
++                if parent.name in ("venv", ".venv"):
++                    executable = str(parent / "bin" / "python")
++                    break
++        master, slave = pty.openpty()
++        child = subprocess.Popen([executable, "-B", "-c", script], stdin=slave,
++                                 stdout=slave, stderr=slave,
++                                 env={**os.environ, "TERM": "xterm-256color",
++                                      "PYTHONDONTWRITEBYTECODE": "1"})
++        os.close(slave)
++        output = b""
++        try:
++            deadline = time.monotonic() + 15
++            while time.monotonic() < deadline:
++                if not select.select([master], [], [], 0.2)[0]:
++                    continue
++                try:
++                    chunk = os.read(master, 65536)
++                except OSError:
++                    break
++                if not chunk:
++                    break
++                output += chunk
++            child.wait(timeout=5)
++        finally:
++            if child.poll() is None:
++                child.kill()
++                child.wait()
++            os.close(master)
++        self.assertEqual(child.returncode, 0, repr(output))
++        ansi = output.decode().replace("\r", "")
++        from tools.ansi_strip import strip_ansi
++        plain = strip_ansi(ansi)
++        self.assertNotIn("SECRET", plain)
++        self.assertNotIn("private tail", plain)
++        self.assertIn("makefile\nall:\n\t@echo hello\n", plain)
++        self.assertEqual(plain.count("@echo hello"), 1)
++        self.assertEqual(plain.count("Done"), 1)
++        self.assertLess(plain.index("@echo hello"), plain.index("Done"))
++        self.assertNotIn("```", plain)
++        self.assertRegex(ansi, r"\x1b\[[0-9;]*38;(?:2|5);")
++        self.assertRegex(ansi, r"\x1b\[[0-9;]*48;(?:2|5);")
++
++    def test_nested_reasoning_stream_matches_final_for_all_chunk_sizes(self):
++        cases = (
++            ("<think>outer\n<reasoning>inner</reasoning>SECRET</think>\nDone", "Done"),
++            ("<THINK>outer<think>inner</think>SECRET</THINK>\nDone", "Done"),
++            ("<think>outer</reasoning>SECRET</think>\nDone", "Done"),
++            ("<think>outer<reasoning>inner</think>SECRET", ""),
++            ("<think><reasoning>inner</reasoning>SECRET</think>```xml\n<think>literal</think>\n```\nDone", "literal"),
++        )
++        for source, visible in cases:
++            for chunk in (1, 2, 7, len(source)):
++                with self.subTest(source=source, chunk=chunk):
++                    obj, output, _ = self.stream(source, chunk)
++                    plain = plain_ansi(output)
++                    self.assertNotIn("SECRET", plain)
++                    self.assertNotIn("inner", plain)
++                    self.assertNotIn("outer", plain)
++                    if visible:
++                        self.assertIn(visible, plain)
++                        self.assertIn(visible, cli._assistant_copy_text(source))
++                    else:
++                        self.assertEqual(cli._assistant_copy_text(source), "")
++                    obj._reset_stream_state()
++                    self.assertEqual(obj._stream_reasoning_stack, [])
++
++    def test_makefile_tabs_preserved_in_ansi_and_supported_copy(self):
++        recipe = "all:\n\t@echo hello\n\t\t@echo **raw**\n"
++        source = "<think>hidden</think>\n```makefile\n" + recipe + "```"
++        self.assertEqual(plain_ansi(code_block_ansi(CodeBlock(recipe, "makefile"))),
++                         "makefile\n" + recipe)
++        obj = cli.HermesCLI.__new__(cli.HermesCLI)
++        obj.conversation_history = [{"role": "assistant", "content": source}]
++        expected = "```makefile\n" + recipe + "```"
++        with patch("hermes_cli.clipboard.is_remote_shell_session", return_value=False), \
++             patch("hermes_cli.clipboard.write_clipboard_text", return_value=True) as copy, \
++             patch.object(cli, "_cprint"):
++            obj._handle_copy_command("/copy")
++        copy.assert_called_once_with(expected)
++        import base64
++        with patch("hermes_cli.clipboard.is_remote_shell_session", return_value=True), \
++             patch.dict("os.environ", {"TMUX": "", "STY": ""}), \
++             patch("hermes_cli.cli_terminal_mixin._write_terminal_sequence") as terminal, \
++             patch.object(cli, "_cprint"):
++            obj._handle_copy_command("/copy 1")
++        terminal.assert_called_once()
++        sequence = terminal.call_args.args[1]
++        self.assertTrue(sequence.startswith("\x1b]52;c;"))
++        self.assertTrue(sequence.endswith("\x07"))
++        self.assertEqual(base64.b64decode(sequence[7:-1]).decode(), expected)
++        self.assertEqual(obj.conversation_history[0]["content"], source)
++        # Rich final panels expand tabs to display cells. Selection is not raw copy.
++        self.assertNotIn("\t", self.final(expected))
++        self.assertIn("        @echo hello", plain_ansi(self.final(expected)))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/hermes_cli/test_cli_modern_layout.py b/tests/hermes_cli/test_cli_modern_layout.py
+index 77d23bc32f..0dfc4491e2 100644
+--- a/tests/hermes_cli/test_cli_modern_layout.py
++++ b/tests/hermes_cli/test_cli_modern_layout.py
+@@ -259,3 +259,44 @@ def test_every_block_is_framed_by_bars_and_blank_lines(monkeypatch):
+                    "", "📖", "💻",                  # tool rows, tight
+                    "", "BAR", "☤", "It", "BAR",    # answer
+                    "", "─"], got                   # footer
++
++
++def test_top_rule_far_right_slot_honors_the_cost_badge_mode():
++    """``display.status_bar.right_badge: cost`` swaps the top rule's far-right auto title for
++    the session-cost badge, gated by the same ``display.status_bar.fields`` list as the classic
++    bar; title mode keeps upstream's auto-title slot untouched.
++
++    Stubbed cli: importing top-level ``cli`` trips the home-I/O guard on installs whose
++    checkout lives under the real ``~/.hermes`` (hermes_bootstrap reads the sibling
++    ``manifest.json``), so the layout function gets a duck-typed namespace instead.
++    """
++    from types import SimpleNamespace
++    from hermes_cli import cli_modern_layout as layout
++
++    state = {"mode": "cost", "fields": frozenset({"cost"})}
++    cli = SimpleNamespace(
++        _agent_running=False, _command_running=False,
++        _get_tui_terminal_width=lambda: 120,
++        _status_bar_display_width=lambda text: len(text or ""),
++        _trim_status_bar_text=lambda text, max_width: (text or "")[:max(0, max_width)],
++        _get_status_bar_field_set=lambda: state["fields"],
++        _get_status_bar_session_title=lambda: "auto session title",
++        _status_bar_right_badge_mode=lambda: state["mode"],
++        _status_bar_right_badge=lambda snapshot, field_set: "Session cost ~$0.1234"
++        if field_set is None or "cost" in field_set else "",
++    )
++
++    line = "".join(text for _, text in layout.top_rule_fragments(cli))
++    assert "Session cost ~$0.1234" in line, line
++    assert "auto session title" not in line, line
++
++    # Title mode (right_badge unset/title) is upstream behavior: the auto title stays.
++    state["mode"] = "title"
++    line = "".join(text for _, text in layout.top_rule_fragments(cli))
++    assert "auto session title" in line, line
++    assert "Session cost" not in line, line
++
++    # Cost mode with an explicit fields list that omits 'cost' hides the badge entirely.
++    state["mode"], state["fields"] = "cost", frozenset({"model"})
++    line = "".join(text for _, text in layout.top_rule_fragments(cli))
++    assert "Session cost" not in line and "auto session title" not in line, line
+diff --git a/tests/hermes_cli/test_cli_status_bar_cost.py b/tests/hermes_cli/test_cli_status_bar_cost.py
+new file mode 100644
+index 0000000000..2c675865af
+--- /dev/null
++++ b/tests/hermes_cli/test_cli_status_bar_cost.py
+@@ -0,0 +1,359 @@
++"""Conversation-cost badge behavior against the real session accounting store."""
++from copy import deepcopy
++from datetime import datetime
++from types import SimpleNamespace
++
++import pytest
++import cli as cli_mod
++from cli import HermesCLI
++from hermes_state import SessionDB
++
++
++@pytest.fixture
++def cost_cli(monkeypatch):
++    config = deepcopy(cli_mod.CLI_CONFIG)
++    config.setdefault("display", {}).setdefault("status_bar", {})["right_badge"] = "cost"
++    config["display"]["status_bar"].pop("fields", None)
++    monkeypatch.setattr(cli_mod, "CLI_CONFIG", config)
++    obj = HermesCLI.__new__(HermesCLI)
++    obj.model = "test-model"
++    obj.session_id = "conversation"
++    obj.session_start = datetime.now()
++    obj.agent = None
++    obj._status_bar_visible = True
++    obj._pending_title = "saved title"
++    obj._is_session_yolo_active = lambda: False
++    return obj
++
++
++@pytest.fixture
++def db(tmp_path, cost_cli):
++    store = SessionDB(db_path=tmp_path / "state.db")
++    store.create_session("conversation", source="cli", model="model-a")
++    store.set_session_title("conversation", "saved title")
++    cost_cli._session_db = store
++    yield store
++    store.close()
++
++
++def record(db, sid="conversation", model="model-a", estimate=0.1234, actual=None,
++           status="estimated", tokens=100):
++    db.update_token_counts(sid, model=model, billing_provider="openai", input_tokens=tokens,
++                           api_call_count=1, estimated_cost_usd=estimate,
++                           actual_cost_usd=actual, cost_status=status)
++
++
++@pytest.mark.parametrize("width", [8, 23, 24, 30, 35, 51, 52, 75, 76, 80, 120])
++@pytest.mark.parametrize("label", ["Session cost $0.1234", "Session cost ~$0.1234", "Session cost unavailable",
++                                   "Session cost ~$<0.0001", "Session cost $<0.0001"])
++def test_renderers_preserve_complete_cost_and_fit(cost_cli, monkeypatch, width, label):
++    monkeypatch.setattr(cost_cli, "_get_status_bar_session_cost", lambda: label)
++    monkeypatch.setattr(cost_cli, "_get_tui_terminal_width", lambda: width)
++    for text in (cost_cli._build_status_bar_text(width),
++                 "".join(value for _, value in cost_cli._get_status_bar_fragments())):
++        assert cost_cli._status_bar_display_width(text) <= width
++        placed = cost_cli._status_title_badge(label, width, cost=True)
++        if placed:
++            assert text.endswith(f" {label} ")
++            assert cost_cli._status_bar_display_width(text) == width
++        else:
++            assert "Session cost" not in text
++        assert "saved title" not in text
++
++
++def test_default_badge_still_title(cost_cli, monkeypatch):
++    config = deepcopy(cli_mod.CLI_CONFIG)
++    config["display"]["status_bar"].pop("right_badge")
++    monkeypatch.setattr(cli_mod, "CLI_CONFIG", config)
++    assert cost_cli._build_status_bar_text(80).endswith(" saved title ")
++
++
++def test_title_saved_and_cost_field_filter(cost_cli, db):
++    record(db)
++    assert cost_cli._build_status_bar_text(80).endswith(" Session cost ~$0.1234 ")
++    assert db.get_session_title("conversation") == "saved title"
++    assert cost_cli._pending_title == "saved title"
++    cost_cli._status_bar_field_set_cache = frozenset({"model", "title"})
++    assert "Session cost" not in cost_cli._build_status_bar_text(80)
++    cost_cli._status_bar_field_set_cache = frozenset({"model", "cost"})
++    assert "Session cost ~$0.1234" in cost_cli._build_status_bar_text(80)
++
++
++def test_model_switch_resume_uses_persisted_sum_not_new_agent(cost_cli, db):
++    record(db, estimate=0.10)
++    record(db, model="model-b", estimate=0.20)
++    cost_cli.agent = SimpleNamespace(model="model-b", session_id="conversation",
++                                   session_api_calls=0, session_estimated_cost_usd=0,
++                                   session_cost_status="unknown")
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.3000"
++    db.create_session("other-account-conversation", source="cli")
++    record(db, sid="other-account-conversation", estimate=90)
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.3000"
++
++
++def test_compression_continuation_accumulates_parent(cost_cli, db):
++    record(db, estimate=0.10)
++    db.end_session("conversation", end_reason="compression")
++    db.create_session("continuation", source="cli", parent_session_id="conversation")
++    record(db, sid="continuation", estimate=0.20)
++    cost_cli.session_id = "continuation"
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.3000"
++
++
++def test_noncompression_child_does_not_absorb_parent(cost_cli, db):
++    record(db, estimate=10)
++    db.create_session("branch", source="cli", parent_session_id="conversation")
++    record(db, sid="branch", estimate=0.20)
++    cost_cli.session_id = "branch"
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.2000"
++
++
++def test_repaint_never_flushes_token_writer(cost_cli, db, monkeypatch):
++    record(db, estimate=0.10)
++    db.end_session("conversation", end_reason="compression")
++    db.create_session("continuation", source="cli", parent_session_id="conversation")
++    record(db, sid="continuation", estimate=0.20)
++    cost_cli.session_id = "continuation"
++    monkeypatch.setattr(db, "flush_token_counts", lambda *a, **k: pytest.fail("UI flushed writer"))
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.3000"
++
++
++def test_actual_single_call_and_partial_actual_not_exact(cost_cli, db):
++    record(db, actual=0.12, status="actual")
++    assert cost_cli._get_status_bar_session_cost() == "Session cost $0.1200"
++    record(db, model="model-b", estimate=0.20)
++    cost_cli._status_bar_cost_cache = None
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.3234"
++    record(db, model="model-b", estimate=0.10, actual=0.09, status="actual")
++    cost_cli._status_bar_cost_cache = None
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.4234"
++
++
++@pytest.mark.parametrize("status,estimate,tokens", [("unknown", None, 100),
++    ("estimated", None, 100), ("estimated", 0, 0), ("estimated", float("nan"), 100),
++    ("estimated", -1, 100)])
++def test_missing_or_invalid_cost_unavailable(cost_cli, status, estimate, tokens):
++    cost_cli.agent = SimpleNamespace(session_api_calls=1, session_cost_status=status,
++                                    session_estimated_cost_usd=estimate, session_input_tokens=tokens)
++    assert cost_cli._get_status_bar_session_cost() == "Session cost unavailable"
++
++
++def test_unknown_route_not_hidden_by_later_known_model(cost_cli, db):
++    record(db, model="unpriced", estimate=None, status="unknown")
++    record(db, model="known", estimate=0.20)
++    assert cost_cli._get_status_bar_session_cost() == "Session cost unavailable"
++
++
++def test_included_is_known_zero_not_unknown(cost_cli, db):
++    record(db, estimate=0, status="included")
++    assert cost_cli._get_status_bar_session_cost() == "Session cost $0.0000"
++
++
++def test_empty_session_is_unavailable(cost_cli, db):
++    assert cost_cli._get_status_bar_session_cost() == "Session cost unavailable"
++
++
++def test_missing_persisted_estimate_does_not_become_zero(cost_cli, db):
++    record(db, estimate=None, status="estimated")
++    assert cost_cli._get_status_bar_session_cost() == "Session cost unavailable"
++
++
++def test_actual_without_complete_total_is_unavailable(cost_cli, db):
++    record(db, estimate=None, actual=0.10, status="actual")
++    record(db, estimate=None, status="actual")
++    assert cost_cli._get_status_bar_session_cost() == "Session cost unavailable"
++
++
++def test_auxiliary_cost_included(cost_cli, db):
++    record(db, estimate=0.10)
++    db.record_auxiliary_usage("conversation", "vision", model="model-b",
++                              input_tokens=10, estimated_cost_usd=0.03)
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.1300"
++
++
++def test_failed_persisted_read_not_replaced_by_resume_local_cost(cost_cli):
++    cost_cli._session_db = SimpleNamespace(_session_lineage_root_to_tip=lambda sid: 1 / 0)
++    cost_cli.agent = SimpleNamespace(session_api_calls=1, session_estimated_cost_usd=2,
++                                    session_cost_status="estimated")
++    assert cost_cli._get_status_bar_session_cost() == "Session cost unavailable"
++
++
++def test_cache_refresh_and_session_identity(cost_cli, db, monkeypatch):
++    monkeypatch.setattr("hermes_cli.cli_status_bar_mixin.time.monotonic", lambda: 10)
++    record(db, estimate=0.10)
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.1000"
++    record(db, estimate=0.20)
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.1000"
++    monkeypatch.setattr("hermes_cli.cli_status_bar_mixin.time.monotonic", lambda: 12)
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.3000"
++    db.create_session("new", source="cli")
++    cost_cli.session_id = "new"
++    assert cost_cli._get_status_bar_session_cost() == "Session cost unavailable"
++
++
++def test_vim_keeps_cost_at_far_right(cost_cli, monkeypatch):
++    monkeypatch.setattr(cost_cli, "_get_status_bar_session_cost", lambda: "Session cost ~$0.1234")
++    monkeypatch.setattr(cost_cli, "_get_tui_terminal_width", lambda: 80)
++    monkeypatch.setattr(cost_cli, "_vim_mode_label", lambda: "NORMAL")
++    text = "".join(value for _, value in cost_cli._get_status_bar_fragments())
++    assert "NORMAL" in text
++    assert text.endswith(" Session cost ~$0.1234 ")
++    assert cost_cli._status_bar_display_width(text) == 80
++
++
++@pytest.mark.parametrize("task", ["voice_chat", "future_per_turn_task"])
++@pytest.mark.parametrize("estimate,status,label", [
++    (0.2, "estimated", "Session cost ~$0.2000"),
++    (0, "included", "Session cost $0.0000"),
++    (None, "included", "Session cost $0.0000"),
++])
++def test_per_turn_task_is_not_auxiliary_spend(cost_cli, db, task, estimate, status, label):
++    db.update_token_counts("conversation", model="voice-model", billing_provider="openai",
++                           task=task, input_tokens=100, api_call_count=1,
++                           estimated_cost_usd=estimate, cost_status=status)
++    assert cost_cli._get_status_bar_session_cost() == label
++    row = dict(db._read_one("SELECT * FROM session_model_usage WHERE task = ?", (task,)))
++    assert row["summary_included"] == 1
++    assert row["cost_status"] == status
++
++
++def test_voice_and_real_auxiliary_usage_are_counted_once(cost_cli, db):
++    record(db, estimate=0.1)
++    db.update_token_counts("conversation", task="voice_chat", model="voice-model",
++                           billing_provider="openai", input_tokens=20, api_call_count=1,
++                           estimated_cost_usd=0.2, cost_status="estimated")
++    db.record_auxiliary_usage("conversation", "vision", model="aux-model",
++                              input_tokens=10, estimated_cost_usd=0.03)
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.3300"
++
++
++@pytest.mark.parametrize("task", ["", "voice_chat"])
++@pytest.mark.parametrize("last_status,last_estimate", [("estimated", 0.2), ("included", 0)])
++@pytest.mark.parametrize("first_status", ["unknown", "estimated"])
++def test_same_route_missing_cost_survives_later_known_call(
++        cost_cli, db, task, last_status, last_estimate, first_status):
++    for status, estimate in [(first_status, None), (last_status, last_estimate)]:
++        db.update_token_counts("conversation", task=task, model="same-route",
++                               billing_provider="openai", input_tokens=100, api_call_count=1,
++                               estimated_cost_usd=estimate, cost_status=status)
++    assert cost_cli._get_status_bar_session_cost() == "Session cost unavailable"
++    summary = db.get_session("conversation")
++    route = dict(db._read_one("SELECT * FROM session_model_usage WHERE task = ?", (task,)))
++    # Existing consumers still see the latest status; the coverage is independent.
++    assert summary["cost_status"] == route["cost_status"] == last_status
++    assert summary["cost_coverage"] == route["cost_coverage"] == "unknown"
++
++
++@pytest.mark.parametrize("first_estimate", [None, 0, -1, float("nan")])
++def test_auxiliary_missing_cost_survives_later_known_call(cost_cli, db, first_estimate):
++    record(db, estimate=0.1)
++    for estimate in [first_estimate, 0.2]:
++        db.record_auxiliary_usage("conversation", "vision", model="same-route",
++                                  input_tokens=10, estimated_cost_usd=estimate)
++    assert cost_cli._get_status_bar_session_cost() == "Session cost unavailable"
++    row = dict(db._read_one("SELECT * FROM session_model_usage WHERE task = 'vision'"))
++    assert row["summary_included"] == 0
++    assert row["cost_coverage"] == "unknown"
++    assert row["cost_status"] is None
++
++
++@pytest.mark.parametrize("legacy_target", ["sessions", "session_model_usage"])
++def test_historical_coverage_is_not_invented(cost_cli, db, legacy_target):
++    record(db, estimate=0.1)
++    db._execute_write(lambda conn: conn.execute(f"UPDATE {legacy_target} SET cost_coverage = NULL"))
++    record(db, estimate=0.2)
++    assert cost_cli._get_status_bar_session_cost() == "Session cost unavailable"
++    row = db._read_one(f"SELECT cost_coverage FROM {legacy_target}")
++    assert row["cost_coverage"] == "historical"
++
++
++@pytest.mark.parametrize("counter", ["bad", float("nan"), float("inf"), -1])
++@pytest.mark.parametrize("width", [8, 35, 80])
++def test_malformed_live_counter_fallback_is_bounded(cost_cli, monkeypatch, counter, width):
++    cost_cli.model = "very-long-model-name-" * 20
++    cost_cli.agent = SimpleNamespace(session_api_calls=counter, session_estimated_cost_usd=0.2,
++                                    session_cost_status="estimated",
++                                    context_compressor=SimpleNamespace(last_prompt_tokens="broken"))
++    monkeypatch.setattr(cost_cli, "_get_tui_terminal_width", lambda: width)
++    for text in (cost_cli._build_status_bar_text(width),
++                 "".join(value for _, value in cost_cli._get_status_bar_fragments())):
++        assert cost_cli._status_bar_display_width(text) <= width
++        if cost_cli._status_title_badge("Session cost unavailable", width, cost=True):
++            assert text.endswith(" Session cost unavailable ")
++
++
++def test_live_multicall_without_coverage_is_unavailable(cost_cli):
++    cost_cli.agent = SimpleNamespace(session_api_calls=2, session_estimated_cost_usd=0.2,
++                                    session_cost_status="estimated")
++    assert cost_cli._get_status_bar_session_cost() == "Session cost unavailable"
++
++
++def test_snapshot_fallback_keeps_vim_when_space_permits(cost_cli, monkeypatch):
++    cost_cli.model = "long-model-" * 20
++    cost_cli.agent = SimpleNamespace(session_api_calls="bad", session_cost_status="estimated",
++                                    context_compressor=SimpleNamespace(last_prompt_tokens="bad"))
++    monkeypatch.setattr(cost_cli, "_vim_mode_label", lambda: "NORMAL")
++    monkeypatch.setattr(cost_cli, "_get_tui_terminal_width", lambda: 80)
++    text = "".join(value for _, value in cost_cli._get_status_bar_fragments())
++    assert "NORMAL" in text
++    assert text.endswith(" Session cost unavailable ")
++    assert cost_cli._status_bar_display_width(text) == 80
++
++
++@pytest.mark.parametrize("task", ["", "voice_chat"])
++def test_included_multiple_calls_remain_known_zero(cost_cli, db, task):
++    for _ in range(2):
++        db.update_token_counts("conversation", model="included-model", task=task,
++                               input_tokens=10, api_call_count=1,
++                               estimated_cost_usd=0, cost_status="included")
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.0000"
++
++
++def test_auxiliary_only_session_uses_auxiliary_ledger(cost_cli, db):
++    db.record_auxiliary_usage("conversation", "vision", model="aux-model",
++                              input_tokens=10, estimated_cost_usd=0.03)
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.0300"
++
++
++def test_tiny_positive_estimate_qualifies_not_zero(cost_cli, db):
++    record(db, estimate=0.000001)
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$<0.0001"
++
++
++def test_tiny_positive_actual_qualifies_not_zero(cost_cli, db):
++    record(db, estimate=None, actual=0.000001, status="actual")
++    assert cost_cli._get_status_bar_session_cost() == "Session cost $<0.0001"
++
++
++def test_positive_estimate_at_precision_keeps_four_decimals(cost_cli, db):
++    record(db, estimate=0.0001)
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.0001"
++
++
++def test_subprecision_boundary_qualifies(cost_cli, db):
++    # 0.000012 rounds to 0.0000 at 4 dp but is positive money.
++    record(db, estimate=0.000012)
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$<0.0001"
++
++
++def test_badge_reads_through_the_gateway_session_store(cost_cli, db, tmp_path):
++    """The rewired CLI's ``_session_db`` is a GatewaySessionStore (the gateway is the single
++    writer). Its ``__getattr__`` allowlist must serve the badge's raw reads
++    (``_session_lineage_root_to_tip`` / ``_read_all`` / ``_is_explicit_fork_child_row``)
++    from the store's read-only WAL reader — otherwise the store returns its ``refused``
++    stub, the badge's except-arm swallows the GatewayClientError, and the badge silently
++    degrades to a permanent "Session cost unavailable"."""
++    from hermes_state import SessionDB as _SessionDB
++    from hermes_cli.gateway_session_store import GatewaySessionStore, SurfaceLabelReader
++
++    record(db)
++    db.flush_token_counts()  # commit so the separate read-only reader sees the rows
++    reader = _SessionDB(db_path=tmp_path / "state.db", read_only=True)
++    store = GatewaySessionStore(connection=SimpleNamespace(final=False))  # __bool__ needs .final
++    store._reader = SurfaceLabelReader(reader)
++    cost_cli._session_db = store
++    cost_cli._status_bar_cost_cache = None
++
++    assert cost_cli._get_status_bar_session_cost() == "Session cost ~$0.1234"
++    # The pre-existing allowlisted read still routes through the reader.
++    assert store.get_session_title("conversation") == "saved title"
+diff --git a/tests/hermes_state/test_cost_coverage.py b/tests/hermes_state/test_cost_coverage.py
+new file mode 100644
+index 0000000000..e27bd2dcc2
+--- /dev/null
++++ b/tests/hermes_state/test_cost_coverage.py
+@@ -0,0 +1,186 @@
++"""Cost coverage survives coalescing, resume, and legacy schema reconciliation."""
++import sqlite3
++
++import pytest
++
++from hermes_state import SessionDB
++
++
++@pytest.fixture
++def db(tmp_path):
++    store = SessionDB(tmp_path / "state.db")
++    store.create_session("s", source="cli", model="m")
++    yield store
++    store.close()
++
++
++def report(estimate, status="estimated", task=""):
++    return dict(model="m", billing_provider="openai", api_call_count=1,
++                input_tokens=10, estimated_cost_usd=estimate, cost_status=status, task=task)
++
++
++@pytest.mark.parametrize("task", ["", "voice_chat"])
++@pytest.mark.parametrize("first,last", [(None, 0.2), (0.2, None), (0, 0.2), (0.2, 0)])
++def test_coalesced_missing_estimate_has_same_coverage_as_sequential(db, tmp_path, task, first, last):
++    batch = [("s", report(estimate, task=task)) for estimate in (first, last)]
++    db._apply_token_batch(batch)
++    with SessionDB(tmp_path / "sequential.db") as sequential:
++        sequential.create_session("s", source="cli", model="m")
++        for sid, kwargs in batch:
++            sequential.update_token_counts(sid, **kwargs)
++        for table in ("sessions", "session_model_usage"):
++            columns = "api_call_count, input_tokens, estimated_cost_usd, cost_status, cost_coverage"
++            actual = dict(db._read_one(f"SELECT {columns} FROM {table}"))
++            expected = dict(sequential._read_one(f"SELECT {columns} FROM {table}"))
++            assert actual == expected
++            assert actual["cost_coverage"] == "unknown"
++            assert actual["api_call_count"] == 2
++
++
++def test_queued_missing_then_known_preserves_gap(db):
++    db.queue_token_counts("s", **report(None, "unknown"))
++    db.queue_token_counts("s", **report(0.2))
++    assert db.flush_token_counts()
++    summary = db.get_session("s")
++    route = dict(db._read_one("SELECT * FROM session_model_usage"))
++    assert summary["cost_status"] == route["cost_status"] == "estimated"
++    assert summary["cost_coverage"] == route["cost_coverage"] == "unknown"
++
++
++def test_complete_included_then_estimated_remains_complete(db):
++    db._apply_token_batch([("s", report(0, "included")), ("s", report(0.2))])
++    for table in ("sessions", "session_model_usage"):
++        row = dict(db._read_one(f"SELECT * FROM {table}"))
++        assert row["cost_coverage"] == "complete"
++        assert row["estimated_cost_usd"] == pytest.approx(0.2)
++
++
++def test_mixed_writer_ownership_is_not_reconciled(db):
++    db.update_token_counts("s", **report(0.2, task="voice_chat"))
++    db.record_auxiliary_usage("s", "voice_chat", model="m", billing_provider="openai",
++                              input_tokens=10, estimated_cost_usd=0.3)
++    row = dict(db._read_one("SELECT * FROM session_model_usage"))
++    assert row["summary_included"] is None
++    assert row["estimated_cost_usd"] == pytest.approx(0.5)
++    assert db.get_session("s")["estimated_cost_usd"] == pytest.approx(0.2)
++
++
++def test_new_columns_leave_legacy_coverage_unproven(tmp_path):
++    path = tmp_path / "legacy.db"
++    with SessionDB(path) as store:
++        store.create_session("s", source="cli")
++        store.update_token_counts("s", **report(0.2))
++    with sqlite3.connect(path) as conn:
++        conn.execute("ALTER TABLE sessions DROP COLUMN cost_coverage")
++        conn.execute("ALTER TABLE session_model_usage DROP COLUMN cost_coverage")
++        conn.execute("ALTER TABLE session_model_usage DROP COLUMN summary_included")
++    with SessionDB(path) as store:
++        assert store.get_session("s")["cost_coverage"] is None
++        route = dict(store._read_one("SELECT * FROM session_model_usage"))
++        assert route["cost_coverage"] is None
++        assert route["summary_included"] is None
++        store.update_token_counts("s", **report(0.3))
++        assert store.get_session("s")["cost_coverage"] == "historical"
++        route = dict(store._read_one("SELECT * FROM session_model_usage"))
++        assert route["cost_coverage"] == "historical"
++        assert route["summary_included"] is None
++
++
++def legacy_usage_pk(conn):
++    """Regress only the key, leaving current usage rows and metadata intact."""
++    conn.execute("PRAGMA foreign_keys=OFF")
++    conn.execute("ALTER TABLE session_model_usage RENAME TO old_usage")
++    ddl = conn.execute("SELECT sql FROM sqlite_master WHERE name='old_usage'").fetchone()[0]
++    ddl = ddl.replace('"old_usage"', "session_model_usage")
++    ddl = ddl.replace("billing_mode, task)", "billing_mode)")
++    conn.execute(ddl)
++    conn.execute("INSERT INTO session_model_usage SELECT * FROM old_usage")
++    conn.execute("DROP TABLE old_usage")
++    conn.execute("PRAGMA foreign_keys=ON")
++
++
++@pytest.mark.parametrize("reopen", [False, True])
++@pytest.mark.parametrize("coverage,ownership", [("complete", 1), ("unknown", 0),
++                                               ("historical", None), (None, None)])
++def test_pk_heal_preserves_existing_coverage_and_ownership(tmp_path, reopen, coverage, ownership):
++    path = tmp_path / "legacy-pk.db"
++    with SessionDB(path) as store:
++        store.create_session("s", source="cli")
++        store.update_token_counts("s", **report(0.2))
++        store._conn.execute("UPDATE session_model_usage SET cost_coverage=?, summary_included=?",
++                            (coverage, ownership))
++        legacy_usage_pk(store._conn)
++        if not reopen:
++            store._heal_session_model_usage_pk(store._conn.cursor())
++            row = dict(store._read_one("SELECT task, cost_coverage, summary_included, estimated_cost_usd "
++                                       "FROM session_model_usage"))
++            assert row == dict(task="", cost_coverage=coverage, summary_included=ownership,
++                               estimated_cost_usd=0.2)
++    with SessionDB(path) as store:
++        row = dict(store._read_one("SELECT task, cost_coverage, summary_included, estimated_cost_usd "
++                                   "FROM session_model_usage"))
++        assert row == dict(task="", cost_coverage=coverage, summary_included=ownership,
++                           estimated_cost_usd=0.2)
++        assert [r[1] for r in store._conn.execute("PRAGMA table_info(session_model_usage)") if r[5]][-1] == "task"
++
++
++@pytest.mark.parametrize("reopen", [False, True])
++@pytest.mark.parametrize("missing", [("cost_coverage",), ("summary_included",),
++                                     ("cost_coverage", "summary_included")])
++def test_pk_heal_missing_metadata_remains_null(tmp_path, reopen, missing):
++    path = tmp_path / "old-metadata.db"
++    with SessionDB(path) as store:
++        store.create_session("s", source="cli")
++        store.update_token_counts("s", **report(0.2))
++        legacy_usage_pk(store._conn)
++        for column in missing:
++            store._conn.execute(f"ALTER TABLE session_model_usage DROP COLUMN {column}")
++        if not reopen:
++            store._heal_session_model_usage_pk(store._conn.cursor())
++            row = dict(store._read_one("SELECT cost_coverage, summary_included FROM session_model_usage"))
++            assert row == dict(cost_coverage=None if "cost_coverage" in missing else "complete",
++                               summary_included=None if "summary_included" in missing else 1)
++    with SessionDB(path) as store:
++        row = dict(store._read_one("SELECT cost_coverage, summary_included FROM session_model_usage"))
++        assert row == dict(cost_coverage=None if "cost_coverage" in missing else "complete",
++                           summary_included=None if "summary_included" in missing else 1)
++        assert store._read_one("SELECT estimated_cost_usd FROM session_model_usage")[0] == 0.2
++
++
++def test_pk_heal_keeps_status_bar_cost_readable(tmp_path):
++    import cli
++
++    path = tmp_path / "status-bar-pk.db"
++    with SessionDB(path) as store:
++        store.create_session("s", source="cli")
++        store.update_token_counts("s", **report(0.2))
++        legacy_usage_pk(store._conn)
++        obj = cli.HermesCLI.__new__(cli.HermesCLI)
++        obj._session_db = store
++        obj.agent = None
++        obj.session_id = "s"
++        assert obj._get_status_bar_session_cost() == "Session cost ~$0.2000"
++        store._heal_session_model_usage_pk(store._conn.cursor())
++        obj._status_bar_cost_cache = None
++        assert obj._get_status_bar_session_cost() == "Session cost ~$0.2000"
++    with SessionDB(path) as store:
++        obj._session_db = store
++        obj._status_bar_cost_cache = None
++        assert obj._get_status_bar_session_cost() == "Session cost ~$0.2000"
++
++
++def test_absolute_multicall_status_does_not_prove_coverage(db):
++    db.update_token_counts("s", **{**report(0.2), "api_call_count": 2, "absolute": True})
++    assert db.get_session("s")["cost_coverage"] == "historical"
++
++
++def test_coalesced_actual_only_calls_are_not_complete_estimate(db, tmp_path):
++    batch = [("s", {**report(None, "actual"), "actual_cost_usd": 0.1}) for _ in range(2)]
++    db._apply_token_batch(batch)
++    with SessionDB(tmp_path / "sequential.db") as sequential:
++        sequential.create_session("s", source="cli", model="m")
++        for sid, kwargs in batch:
++            sequential.update_token_counts(sid, **kwargs)
++        for table in ("sessions", "session_model_usage"):
++            assert db._read_one(f"SELECT cost_coverage FROM {table}")[0] == "unknown"
++            assert sequential._read_one(f"SELECT cost_coverage FROM {table}")[0] == "unknown"
