@@ -7,6 +7,7 @@ per-OS site-packages roots. When no root carries pytest this exits 2 with the on
 sanctioned remedy instead of installing anything.
 """
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -94,6 +95,25 @@ def runtime_interpreter(launcher):
                              check=True, capture_output=True, text=True)
     return Path(json.loads(command.stdout)[0])
 
+def committed_env_exists(home, repo):
+    """pm scopes a checkout's dependency state by sha256(path)[:16]
+    (pm/environments.py:20-22); without a committed facts.json the pinned
+    store interpreter's bootstrap refuses the checkout outright
+    (NoCommittedEnvironment)."""
+    key = hashlib.sha256(str(repo).encode("utf-8")).hexdigest()[:16]
+    return (home / "installs" / key / "facts.json").is_file()
+
+
+def venv_interpreter(repo):
+    """The repo's own dev-synced .venv interpreter: the blessed interpreter for
+    gating a checkout pm has not committed an environment for."""
+    for candidate in (repo / ".venv" / "bin" / "python3",
+                      repo / ".venv" / "bin" / "python",
+                      repo / ".venv" / "Scripts" / "python.exe"):
+        if candidate.exists():
+            return candidate
+    return None
+
 
 def uv_cache_roots(home):
     explicit = os.environ.get("UV_CACHE_DIR")
@@ -157,7 +177,7 @@ def main():
     if missing:
         print("this checkout does not carry the TUI port: {} of {} listed "
               "test files are missing (first: {}). The port lives on branch "
-              "tui-port-v0.22.4 of the port repository; install it first "
+              "tui-port-v0.22.4 in the tank bare repo; install it first "
               "(packaging-design.md has the quickstart) or pass --repo at a "
               "checkout that carries it.".format(
                   len(missing), len(TESTS), missing[0]), file=sys.stderr)
@@ -165,6 +185,15 @@ def main():
 
     if args.python is not None:
         interpreter = args.python
+    elif not committed_env_exists(home, repo):
+        # A fresh clone has no committed pm environment, so the pinned store
+        # interpreter would refuse its own bootstrap (NoCommittedEnvironment).
+        interpreter = venv_interpreter(repo)
+        if interpreter is None:
+            print("no committed pm environment for this checkout and no .venv in it; "
+                  "run the sanctioned dev sync (`uv sync --locked --group dev`) inside "
+                  "{}, then rerun, or pass --python".format(repo), file=sys.stderr)
+            return 2
     else:
         launcher = launcher_path(home, repo)
         if launcher is None:
